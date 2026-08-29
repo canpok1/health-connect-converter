@@ -8,4 +8,4 @@ services:
       HC_POLL_INTERVAL: "1h"
     volumes:
       - ./secrets/sa-key.json:/run/secrets/sa-key.json:ro
-      - /srv/health-connect-converter/data:/data
+      - ./data:/data

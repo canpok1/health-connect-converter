@@ -33,6 +33,9 @@ go.work.sum
 # secrets mounted into the container
 /secrets/
 
+# runtime data (cumulative SQLite, state)
+/data/
+
 # Editor/IDE
 # .idea/
 # .vscode/
