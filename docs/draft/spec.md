@@ -147,9 +147,9 @@ types:
 
 ## 配備：Docker Compose
 
-ホストに追加インストールするものは Docker のみ。既存の web サービスと同じ `docker compose up -d` 運用に揃える。
+このリポジトリ自体は `docker-compose.yml` を持たない。配備先は自宅の mini-pc で、サービス定義は [mini-pc-setup](https://github.com/canpok1/mini-pc-setup) が管理する compose.yml に追記する（`cloudflared` と同じパターン。`plant-diary` のように本リポジトリを git clone して `project_src` に指定する方式ではない）。
 
-イメージは GitHub Actions でビルドし GHCR へ push する（plant-diary と同じ運用。経緯は [ADR 0001](../adr/0001-distribute-container-image-via-ghcr.md)）。
+ホストに追加インストールするものは Docker のみ。イメージは GitHub Actions でビルドし GHCR へ push する（経緯は [ADR 0001](../adr/0001-distribute-container-image-via-ghcr.md)）。mini-pc-setup 側に追加するサービス定義は以下の想定：
 
 ```yaml
 services:
@@ -169,7 +169,6 @@ services:
 - **スケジューラはコンテナ内の常駐ループ**（`処理 → sleep` の繰り返し）。cron も systemd timer も不要で、追加バイナリがゼロになる
 - `/data` は named volume ではなく **bind mount**。累積 DB が正史なので、既存のバックアップ運用にそのまま乗せられる形にする
 - SA 鍵は環境変数ではなく **read-only マウント**。環境変数はログや `docker inspect` に露出する
-- 手動実行は `docker compose run --rm health-connect-converter --once`。初回のスキーマ調査とバックフィルにも使う
 
 **エラー時の挙動**：常駐ループはエラーで終了しない。ログに出して state を更新せず、次の周回でリトライする。プロセスを落とすと `restart: unless-stopped` が再起動ループを作り、かえって気づきにくくなる。
 
@@ -187,14 +186,15 @@ services:
 
 ZIP 展開は標準 `archive/zip`、ポーリングは標準 `time.Ticker` で足りる。
 
-## Ansible
+## Ansible（mini-pc-setup）
 
-role `health_connect_export` の責務は「ファイル配置」と「compose の適用」に収まる。
+mini-pc-setup 側に追加する role の責務は「ファイル配置」と「compose.yml への追記」に収まる。本リポジトリを host へ配置する必要はない（イメージは GHCR から pull する）。
 
-1. `compose.yaml` / `config.yaml` を配置（イメージは GHCR から pull するため Dockerfile / Go ソースの配置は不要）
+1. `config.yaml` を配置
 2. SA 鍵を Ansible Vault から復号して配置（0600）
-3. `community.docker.docker_compose_v2` で `pull` してから `up -d`
-4. 配置ファイルの変更時に handler で再起動
+3. mini-pc-setup が管理する compose.yml に `health-connect-converter` サービスを追記
+4. `community.docker.docker_compose_v2` で `pull` してから `up -d`
+5. 配置ファイルの変更時に handler で再起動
 
 ## 事前の手作業
 

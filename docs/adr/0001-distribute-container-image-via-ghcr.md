@@ -9,11 +9,11 @@
 
 ## 決定
 
-plant-diaryと同様、GitHub Actionsでイメージをビルドし GHCR (ghcr.io) へ push する。`docker-compose.yml` は `image: ghcr.io/canpok1/health-connect-converter:latest` を pull する構成にする。
+plant-diaryと同様、GitHub Actionsでイメージをビルドし GHCR (ghcr.io) へ push する。配備先の compose 定義（mini-pc-setup側で管理）は `image: ghcr.io/canpok1/health-connect-converter:latest` を pull する構成にする。
 
 ## 結果
 
-- 良い影響: CIで検証済みのイメージをそのままデプロイでき、サーバー側でのビルドが不要になる。plant-diaryと運用手順（`docker compose pull && up -d`）が揃う。
+- 良い影響: CIで検証済みのイメージをそのままデプロイでき、サーバー側でのビルドが不要になる。
 - 悪い影響: spec.mdが前提としていた「ホストへの追加インストールはDockerのみ」「レジストリ不使用」という制約から外れる。GHCRへの到達性（インターネット接続）がサーバー側に必要になる。
 
 ## 検討した代替案
