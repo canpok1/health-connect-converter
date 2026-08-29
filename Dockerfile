@@ -10,5 +10,6 @@ RUN CGO_ENABLED=0 go build -o health-connect-converter ./cmd/health-connect-conv
 FROM gcr.io/distroless/static-debian12
 WORKDIR /app
 COPY --from=builder /app/health-connect-converter .
+COPY config.yaml .
 USER nonroot:nonroot
 ENTRYPOINT ["/app/health-connect-converter"]

@@ -1,0 +1,9 @@
+types:
+  blood_pressure:
+    source_table: blood_pressure_record_table
+    window: all
+    daily: [mean, count]
+  heart_rate:
+    source_table: heart_rate_record_series_table
+    window: 30d
+    daily: [mean, min, max]
