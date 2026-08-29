@@ -161,7 +161,10 @@ services:
     restart: unless-stopped
     environment:
       TZ: Asia/Tokyo
-      HC_POLL_INTERVAL: "1h"     # time.ParseDuration 形式
+      HC_POLL_INTERVAL: "${HC_POLL_INTERVAL:-1h}"     # time.ParseDuration 形式
+      HC_LOG_LEVEL: "${HC_LOG_LEVEL:-info}"
+      HC_DRIVE_FOLDER_ID: "${HC_DRIVE_FOLDER_ID:?HC_DRIVE_FOLDER_ID is required}"
+      HC_SPREADSHEET_ID: "${HC_SPREADSHEET_ID:?HC_SPREADSHEET_ID is required}"
     volumes:
       - ./secrets/sa-key.json:/run/secrets/sa-key.json:ro
       - ./data:/data     # 累積 SQLite と state
@@ -171,6 +174,7 @@ services:
 - `/data` は named volume ではなく **bind mount**。累積 DB が正史なので、既存のバックアップ運用にそのまま乗せられる形にする
 - ホスト側パスは `./data`（git clone先の直下）。mini-pc の Docker は snap 版で AppArmor により `$HOME` 配下以外へのbind mountができないため、`/srv/...` のような絶対パスは使えない（経緯は [ADR 0003](../adr/0003-relative-data-volume-path.md)）
 - SA 鍵は環境変数ではなく **read-only マウント**。環境変数はログや `docker inspect` に露出する
+- Drive フォルダID・スプレッドシートIDはホスト側の `.env`（gitignore対象、コミットするのは `.env.example`）で渡す。未設定だと `docker compose` が起動前にエラーになる（経緯は [ADR 0005](../adr/0005-deployment-identifiers-via-env-file.md)）
 - 手動実行は `docker compose run --rm health-connect-converter --once`。初回のスキーマ調査とバックフィルにも使う
 
 **エラー時の挙動**：常駐ループはエラーで終了しない。ログに出して state を更新せず、次の周回でリトライする。プロセスを落とすと `restart: unless-stopped` が再起動ループを作り、かえって気づきにくくなる。

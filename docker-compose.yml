@@ -5,7 +5,10 @@ services:
     restart: unless-stopped
     environment:
       TZ: Asia/Tokyo
-      HC_POLL_INTERVAL: "1h"
+      HC_POLL_INTERVAL: "${HC_POLL_INTERVAL:-1h}"
+      HC_LOG_LEVEL: "${HC_LOG_LEVEL:-info}"
+      HC_DRIVE_FOLDER_ID: "${HC_DRIVE_FOLDER_ID:?HC_DRIVE_FOLDER_ID is required}"
+      HC_SPREADSHEET_ID: "${HC_SPREADSHEET_ID:?HC_SPREADSHEET_ID is required}"
     volumes:
       - ./secrets/sa-key.json:/run/secrets/sa-key.json:ro
       - ./data:/data
