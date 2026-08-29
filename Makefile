@@ -13,8 +13,8 @@ test:
 .PHONY: build
 build:
 	mkdir -p ./bin
-	go build -v -o ./bin/hc-export ./cmd/hc-export
+	go build -v -o ./bin/health-connect-converter ./cmd/health-connect-converter
 
 .PHONY: run
 run:
-	go run ./cmd/hc-export
+	go run ./cmd/health-connect-converter

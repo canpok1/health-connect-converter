@@ -97,7 +97,7 @@ SQLite ドライバは **`modernc.org/sqlite`（純Go実装）** を使う。cgo
 | `internal/store` | 累積 SQLite。UPSERT・期間クエリ・日次集約 | `database/sql` のみ |
 | `internal/sheetssink` | タブ書き込み。無ければ `addSheet`、あれば `clear` + `update` | Sheets API |
 
-`cmd/hc-export` はこの4つを繋ぎ、`time.Ticker` でポーリングループを回すだけ。`--once` フラグで1回だけ実行して終了する。
+`cmd/health-connect-converter` はこの4つを繋ぎ、`time.Ticker` でポーリングループを回すだけ。`--once` フラグで1回だけ実行して終了する。
 
 外部 API に触る2つはインターフェースで抽象化し、テストではフェイク実装を挿す。
 
@@ -147,12 +147,15 @@ types:
 
 ## 配備：Docker Compose
 
-ホストに追加インストールするものは Docker のみ。既存の web サービスと同じ `docker compose up -d` 運用に揃える。
+`docker-compose.yml` は本リポジトリに置く。配備先は自宅の mini-pc で、[mini-pc-setup](https://github.com/canpok1/mini-pc-setup) の Ansible role が本リポジトリを git clone し、`community.docker.docker_compose_v2` の `project_src` にこのディレクトリを指定して起動する（`plant-diary` と同じパターン。`cloudflared` のように mini-pc-setup 側で compose 定義を管理する方式ではない）。
+
+ホストに追加インストールするものは Docker のみ。イメージは GitHub Actions でビルドし GHCR へ push する（経緯は [ADR 0001](../adr/0001-distribute-container-image-via-ghcr.md)）。
 
 ```yaml
 services:
-  hc-export:
-    build: .
+  health-connect-converter:
+    image: ghcr.io/canpok1/health-connect-converter:latest
+    pull_policy: always
     restart: unless-stopped
     environment:
       TZ: Asia/Tokyo
@@ -160,17 +163,17 @@ services:
     volumes:
       - ./config.yaml:/app/config.yaml:ro
       - ./secrets/sa-key.json:/run/secrets/sa-key.json:ro
-      - /srv/hc-export/data:/data     # 累積 SQLite と state
+      - /srv/health-connect-converter/data:/data     # 累積 SQLite と state
 ```
 
 - **スケジューラはコンテナ内の常駐ループ**（`処理 → sleep` の繰り返し）。cron も systemd timer も不要で、追加バイナリがゼロになる
 - `/data` は named volume ではなく **bind mount**。累積 DB が正史なので、既存のバックアップ運用にそのまま乗せられる形にする
 - SA 鍵は環境変数ではなく **read-only マウント**。環境変数はログや `docker inspect` に露出する
-- 手動実行は `docker compose run --rm hc-export --once`。初回のスキーマ調査とバックフィルにも使う
+- 手動実行は `docker compose run --rm health-connect-converter --once`。初回のスキーマ調査とバックフィルにも使う
 
 **エラー時の挙動**：常駐ループはエラーで終了しない。ログに出して state を更新せず、次の周回でリトライする。プロセスを落とすと `restart: unless-stopped` が再起動ループを作り、かえって気づきにくくなる。
 
-**イメージ**：マルチステージビルド。ビルド段は `golang:1`（最新安定版）、実行段は `gcr.io/distroless/static-debian12`（CA 証明書を含み、非 root で動く）。`CGO_ENABLED=0` で静的バイナリを1つ置くだけの構成になる。自宅サーバー1台なのでレジストリは使わずローカルビルド。
+**イメージ**：マルチステージビルド。ビルド段は `golang:1`（最新安定版）、実行段は `gcr.io/distroless/static-debian12`（CA 証明書を含み、非 root で動く）。`CGO_ENABLED=0` で静的バイナリを1つ置くだけの構成になる。
 
 **主な依存**：
 
@@ -184,14 +187,15 @@ services:
 
 ZIP 展開は標準 `archive/zip`、ポーリングは標準 `time.Ticker` で足りる。
 
-## Ansible
+## Ansible（mini-pc-setup）
 
-role `health_connect_export` の責務は「ファイル配置」と「compose の適用」に収まる。
+mini-pc-setup 側に追加する role の責務は、plant-diary と同じ形（`tasks/plant-diary.yml` 相当）に揃える。
 
-1. `compose.yaml` / `Dockerfile` / Go ソース一式 / `config.yaml` を配置
-2. SA 鍵を Ansible Vault から復号して配置（0600）
-3. `community.docker.docker_compose_v2` で `up -d --build`
-4. 配置ファイルの変更時に handler で再起動
+1. 本リポジトリを `git clone`（`ansible.builtin.git`）
+2. `config.yaml` を配置
+3. SA 鍵を Ansible Vault から復号して `secrets/sa-key.json` に配置（0600）
+4. GHCR へログイン（`community.docker.docker_login`。plant-diary 用のログインを共用できる）
+5. `community.docker.docker_compose_v2` で `project_src` にクローン先ディレクトリを指定し `up -d`（`pull_policy: always` のため明示的な `pull` は不要）
 
 ## 事前の手作業
 
