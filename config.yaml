@@ -1,9 +1,38 @@
 types:
   blood_pressure:
     source_table: blood_pressure_record_table
+    time_layout: instant
+    columns:
+      systolic:
+        column: systolic
+      diastolic:
+        column: diastolic
     window: all
-    daily: [mean, count]
+    daily: [mean, min, max, count]
+
   heart_rate:
-    source_table: heart_rate_record_series_table
+    source_table: heart_rate_record_table
+    time_layout: series
+    series_table: heart_rate_record_series_table
+    columns:
+      bpm:
+        column: beats_per_minute
+    window: all
+    daily: [mean, min, max, count]
+
+  sleep:
+    source_table: sleep_session_record_table
+    time_layout: interval
+    columns: {}
+    include_duration: true
+    window: all
+    daily: [sum, count]
+
+  steps:
+    source_table: steps_record_table
+    time_layout: interval
+    columns:
+      count:
+        column: count
     window: 30d
-    daily: [mean, min, max]
+    daily: [sum]
