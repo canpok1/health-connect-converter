@@ -145,6 +145,8 @@ types:
 
 対象は バイタル（血圧・心拍・安静時心拍・SpO2・体温・HRV）／睡眠／活動（歩数・距離・消費カロリー・運動セッション）／身体測定（体重・体脂肪率）の4群、10〜15種別程度。
 
+`config.yaml` は本リポジトリにコミットしイメージへ同梱する（デプロイ先はmini-pc 1台のみで、環境ごとに切り替える想定がないため。経緯は [ADR 0002](../adr/0002-bundle-config-into-image.md)）。
+
 ## 配備：Docker Compose
 
 `docker-compose.yml` は本リポジトリに置く。配備先は自宅の mini-pc で、[mini-pc-setup](https://github.com/canpok1/mini-pc-setup) の Ansible role が本リポジトリを git clone し、`community.docker.docker_compose_v2` の `project_src` にこのディレクトリを指定して起動する（`plant-diary` と同じパターン。`cloudflared` のように mini-pc-setup 側で compose 定義を管理する方式ではない）。
@@ -161,7 +163,6 @@ services:
       TZ: Asia/Tokyo
       HC_POLL_INTERVAL: "1h"     # time.ParseDuration 形式
     volumes:
-      - ./config.yaml:/app/config.yaml:ro
       - ./secrets/sa-key.json:/run/secrets/sa-key.json:ro
       - /srv/health-connect-converter/data:/data     # 累積 SQLite と state
 ```
@@ -192,10 +193,9 @@ ZIP 展開は標準 `archive/zip`、ポーリングは標準 `time.Ticker` で�
 mini-pc-setup 側に追加する role の責務は、plant-diary と同じ形（`tasks/plant-diary.yml` 相当）に揃える。
 
 1. 本リポジトリを `git clone`（`ansible.builtin.git`）
-2. `config.yaml` が無ければ `config.example.yaml` からコピーして配置（`.env.example` → `.env` と同じパターン）
-3. SA 鍵を Ansible Vault から復号して `secrets/sa-key.json` に配置（0600）
-4. GHCR へログイン（`community.docker.docker_login`。plant-diary 用のログインを共用できる）
-5. `community.docker.docker_compose_v2` で `project_src` にクローン先ディレクトリを指定し `up -d`（`pull_policy: always` のため明示的な `pull` は不要）
+2. SA 鍵を Ansible Vault から復号して `secrets/sa-key.json` に配置（0600）
+3. GHCR へログイン（`community.docker.docker_login`。plant-diary 用のログインを共用できる）
+4. `community.docker.docker_compose_v2` で `project_src` にクローン先ディレクトリを指定し `up -d`（`pull_policy: always` のため明示的な `pull` は不要）
 
 ## 事前の手作業
 
