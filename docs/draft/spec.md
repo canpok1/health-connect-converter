@@ -192,7 +192,7 @@ ZIP 展開は標準 `archive/zip`、ポーリングは標準 `time.Ticker` で�
 mini-pc-setup 側に追加する role の責務は、plant-diary と同じ形（`tasks/plant-diary.yml` 相当）に揃える。
 
 1. 本リポジトリを `git clone`（`ansible.builtin.git`）
-2. `config.yaml` を配置
+2. `config.yaml` が無ければ `config.example.yaml` からコピーして配置（`.env.example` → `.env` と同じパターン）
 3. SA 鍵を Ansible Vault から復号して `secrets/sa-key.json` に配置（0600）
 4. GHCR へログイン（`community.docker.docker_login`。plant-diary 用のログインを共用できる）
 5. `community.docker.docker_compose_v2` で `project_src` にクローン先ディレクトリを指定し `up -d`（`pull_policy: always` のため明示的な `pull` は不要）

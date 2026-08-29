@@ -30,6 +30,12 @@ go.work.sum
 # env file
 .env
 
+# runtime config (generated from config.example.yaml)
+/config.yaml
+
+# secrets mounted into the container
+/secrets/
+
 # Editor/IDE
 # .idea/
 # .vscode/
