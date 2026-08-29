@@ -149,10 +149,13 @@ types:
 
 ホストに追加インストールするものは Docker のみ。既存の web サービスと同じ `docker compose up -d` 運用に揃える。
 
+イメージは GitHub Actions でビルドし GHCR へ push する（plant-diary と同じ運用。経緯は [ADR 0001](../adr/0001-distribute-container-image-via-ghcr.md)）。
+
 ```yaml
 services:
   hc-export:
-    build: .
+    image: ghcr.io/canpok1/health-connect-converter/hc-export:latest
+    pull_policy: always
     restart: unless-stopped
     environment:
       TZ: Asia/Tokyo
@@ -170,7 +173,7 @@ services:
 
 **エラー時の挙動**：常駐ループはエラーで終了しない。ログに出して state を更新せず、次の周回でリトライする。プロセスを落とすと `restart: unless-stopped` が再起動ループを作り、かえって気づきにくくなる。
 
-**イメージ**：マルチステージビルド。ビルド段は `golang:1`（最新安定版）、実行段は `gcr.io/distroless/static-debian12`（CA 証明書を含み、非 root で動く）。`CGO_ENABLED=0` で静的バイナリを1つ置くだけの構成になる。自宅サーバー1台なのでレジストリは使わずローカルビルド。
+**イメージ**：マルチステージビルド。ビルド段は `golang:1`（最新安定版）、実行段は `gcr.io/distroless/static-debian12`（CA 証明書を含み、非 root で動く）。`CGO_ENABLED=0` で静的バイナリを1つ置くだけの構成になる。
 
 **主な依存**：
 
@@ -188,9 +191,9 @@ ZIP 展開は標準 `archive/zip`、ポーリングは標準 `time.Ticker` で�
 
 role `health_connect_export` の責務は「ファイル配置」と「compose の適用」に収まる。
 
-1. `compose.yaml` / `Dockerfile` / Go ソース一式 / `config.yaml` を配置
+1. `compose.yaml` / `config.yaml` を配置（イメージは GHCR から pull するため Dockerfile / Go ソースの配置は不要）
 2. SA 鍵を Ansible Vault から復号して配置（0600）
-3. `community.docker.docker_compose_v2` で `up -d --build`
+3. `community.docker.docker_compose_v2` で `pull` してから `up -d`
 4. 配置ファイルの変更時に handler で再起動
 
 ## 事前の手作業
