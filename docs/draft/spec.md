@@ -97,7 +97,7 @@ SQLite ドライバは **`modernc.org/sqlite`（純Go実装）** を使う。cgo
 | `internal/store` | 累積 SQLite。UPSERT・期間クエリ・日次集約 | `database/sql` のみ |
 | `internal/sheetssink` | タブ書き込み。無ければ `addSheet`、あれば `clear` + `update` | Sheets API |
 
-`cmd/hc-export` はこの4つを繋ぎ、`time.Ticker` でポーリングループを回すだけ。`--once` フラグで1回だけ実行して終了する。
+`cmd/health-connect-converter` はこの4つを繋ぎ、`time.Ticker` でポーリングループを回すだけ。`--once` フラグで1回だけ実行して終了する。
 
 外部 API に触る2つはインターフェースで抽象化し、テストではフェイク実装を挿す。
 
@@ -153,8 +153,8 @@ types:
 
 ```yaml
 services:
-  hc-export:
-    image: ghcr.io/canpok1/health-connect-converter/hc-export:latest
+  health-connect-converter:
+    image: ghcr.io/canpok1/health-connect-converter:latest
     pull_policy: always
     restart: unless-stopped
     environment:
@@ -163,13 +163,13 @@ services:
     volumes:
       - ./config.yaml:/app/config.yaml:ro
       - ./secrets/sa-key.json:/run/secrets/sa-key.json:ro
-      - /srv/hc-export/data:/data     # 累積 SQLite と state
+      - /srv/health-connect-converter/data:/data     # 累積 SQLite と state
 ```
 
 - **スケジューラはコンテナ内の常駐ループ**（`処理 → sleep` の繰り返し）。cron も systemd timer も不要で、追加バイナリがゼロになる
 - `/data` は named volume ではなく **bind mount**。累積 DB が正史なので、既存のバックアップ運用にそのまま乗せられる形にする
 - SA 鍵は環境変数ではなく **read-only マウント**。環境変数はログや `docker inspect` に露出する
-- 手動実行は `docker compose run --rm hc-export --once`。初回のスキーマ調査とバックフィルにも使う
+- 手動実行は `docker compose run --rm health-connect-converter --once`。初回のスキーマ調査とバックフィルにも使う
 
 **エラー時の挙動**：常駐ループはエラーで終了しない。ログに出して state を更新せず、次の周回でリトライする。プロセスを落とすと `restart: unless-stopped` が再起動ループを作り、かえって気づきにくくなる。
 

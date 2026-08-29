@@ -4,11 +4,11 @@ WORKDIR /app
 COPY go.mod go.sum* ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -o hc-export ./cmd/hc-export
+RUN CGO_ENABLED=0 go build -o health-connect-converter ./cmd/health-connect-converter
 
 # Run stage
 FROM gcr.io/distroless/static-debian12
 WORKDIR /app
-COPY --from=builder /app/hc-export .
+COPY --from=builder /app/health-connect-converter .
 USER nonroot:nonroot
-ENTRYPOINT ["/app/hc-export"]
+ENTRYPOINT ["/app/health-connect-converter"]

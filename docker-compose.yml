@@ -1,6 +1,6 @@
 services:
-  hc-export:
-    image: ghcr.io/canpok1/health-connect-converter/hc-export:latest
+  health-connect-converter:
+    image: ghcr.io/canpok1/health-connect-converter:latest
     pull_policy: always
     restart: unless-stopped
     environment:
@@ -9,4 +9,4 @@ services:
     volumes:
       - ./config.yaml:/app/config.yaml:ro
       - ./secrets/sa-key.json:/run/secrets/sa-key.json:ro
-      - /srv/hc-export/data:/data
+      - /srv/health-connect-converter/data:/data

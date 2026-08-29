@@ -24,7 +24,7 @@ make build
 
 ## デプロイ
 
-GitHub Actions で main ブランチへの push をトリガーにコンテナイメージをビルドし、GHCR (`ghcr.io/canpok1/health-connect-converter/hc-export`) へ push する。配備先では以下で起動する。
+GitHub Actions で main ブランチへの push をトリガーにコンテナイメージをビルドし、GHCR (`ghcr.io/canpok1/health-connect-converter`) へ push する。配備先では以下で起動する。
 
 ```bash
 docker compose pull

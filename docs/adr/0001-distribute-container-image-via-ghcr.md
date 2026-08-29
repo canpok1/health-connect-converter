@@ -9,7 +9,7 @@
 
 ## 決定
 
-plant-diaryと同様、GitHub Actionsでイメージをビルドし GHCR (ghcr.io) へ push する。`docker-compose.yml` は `image: ghcr.io/canpok1/health-connect-converter/hc-export:latest` を pull する構成にする。
+plant-diaryと同様、GitHub Actionsでイメージをビルドし GHCR (ghcr.io) へ push する。`docker-compose.yml` は `image: ghcr.io/canpok1/health-connect-converter:latest` を pull する構成にする。
 
 ## 結果
 
