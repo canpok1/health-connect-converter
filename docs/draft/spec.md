@@ -164,11 +164,12 @@ services:
       HC_POLL_INTERVAL: "1h"     # time.ParseDuration 形式
     volumes:
       - ./secrets/sa-key.json:/run/secrets/sa-key.json:ro
-      - /srv/health-connect-converter/data:/data     # 累積 SQLite と state
+      - ./data:/data     # 累積 SQLite と state
 ```
 
 - **スケジューラはコンテナ内の常駐ループ**（`処理 → sleep` の繰り返し）。cron も systemd timer も不要で、追加バイナリがゼロになる
 - `/data` は named volume ではなく **bind mount**。累積 DB が正史なので、既存のバックアップ運用にそのまま乗せられる形にする
+- ホスト側パスは `./data`（git clone先の直下）。mini-pc の Docker は snap 版で AppArmor により `$HOME` 配下以外へのbind mountができないため、`/srv/...` のような絶対パスは使えない（経緯は [ADR 0003](../adr/0003-relative-data-volume-path.md)）
 - SA 鍵は環境変数ではなく **read-only マウント**。環境変数はログや `docker inspect` に露出する
 - 手動実行は `docker compose run --rm health-connect-converter --once`。初回のスキーマ調査とバックフィルにも使う
 
