@@ -1,0 +1,12 @@
+services:
+  hc-export:
+    image: ghcr.io/canpok1/health-connect-converter/hc-export:latest
+    pull_policy: always
+    restart: unless-stopped
+    environment:
+      TZ: Asia/Tokyo
+      HC_POLL_INTERVAL: "1h"
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./secrets/sa-key.json:/run/secrets/sa-key.json:ro
+      - /srv/hc-export/data:/data
