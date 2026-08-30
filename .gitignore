@@ -36,6 +36,10 @@ go.work.sum
 # runtime data (cumulative SQLite, state)
 /data/
 
+# ヘルスコネクトのエクスポート実物（個人の健康データ。調査用に手元へ置くだけでコミットしない）
+*.db
+*.zip
+
 # Editor/IDE
 # .idea/
 # .vscode/

@@ -161,7 +161,10 @@ services:
     restart: unless-stopped
     environment:
       TZ: Asia/Tokyo
-      HC_POLL_INTERVAL: "1h"     # time.ParseDuration 形式
+      HC_POLL_INTERVAL: "${HC_POLL_INTERVAL:-1h}"     # time.ParseDuration 形式
+      HC_LOG_LEVEL: "${HC_LOG_LEVEL:-info}"
+      HC_DRIVE_FOLDER_ID: "${HC_DRIVE_FOLDER_ID:?HC_DRIVE_FOLDER_ID is required}"
+      HC_SPREADSHEET_ID: "${HC_SPREADSHEET_ID:?HC_SPREADSHEET_ID is required}"
     volumes:
       - ./secrets/sa-key.json:/run/secrets/sa-key.json:ro
       - ./data:/data     # 累積 SQLite と state
@@ -171,6 +174,7 @@ services:
 - `/data` は named volume ではなく **bind mount**。累積 DB が正史なので、既存のバックアップ運用にそのまま乗せられる形にする
 - ホスト側パスは `./data`（git clone先の直下）。mini-pc の Docker は snap 版で AppArmor により `$HOME` 配下以外へのbind mountができないため、`/srv/...` のような絶対パスは使えない（経緯は [ADR 0003](../adr/0003-relative-data-volume-path.md)）
 - SA 鍵は環境変数ではなく **read-only マウント**。環境変数はログや `docker inspect` に露出する
+- Drive フォルダID・スプレッドシートIDはホスト側の `.env`（gitignore対象、コミットするのは `.env.example`）で渡す。未設定だと `docker compose` が起動前にエラーになる（経緯は [ADR 0005](../adr/0005-deployment-identifiers-via-env-file.md)）
 - 手動実行は `docker compose run --rm health-connect-converter --once`。初回のスキーマ調査とバックフィルにも使う
 
 **エラー時の挙動**：常駐ループはエラーで終了しない。ログに出して state を更新せず、次の周回でリトライする。プロセスを落とすと `restart: unless-stopped` が再起動ループを作り、かえって気づきにくくなる。
@@ -208,16 +212,14 @@ mini-pc-setup 側に追加する role の責務は、plant-diary と同じ形（
 
 以降のタブ追加・更新は全自動。
 
-## 実装前に確定が必要な点
+## エクスポート DB のスキーマ（調査済み）
 
-**エクスポート DB のスキーマには公式ドキュメントがない。** 本設計中のテーブル名（`blood_pressure_record_table` 等）は非公式情報からの推定であり、未検証。
+当初「実装前に確定が必要な点」として残していたエクスポート DB のスキーマは、実物を読んで確定させた。結果は [docs/health-connect-export-schema.md](../health-connect-export-schema.md) を参照。
 
-実装の最初のステップは、実際に1回エクスポートを走らせて `sqlite3` CLI で `.schema` を吸い出し、対象種別ごとのテーブル名・列名・単位を確定させること。ここが埋まるまで `internal/hcreader` は書けない。
+本ファイルの記述と食い違っていた点（心拍の `source_table`、共通列の構成、睡眠ステージの有無、単位）は調査結果側にまとめてある。**食い違う場合は調査結果側が正しい。**
 
-この調査は手作業でよく、Go のコードを書く必要はない。確定したスキーマをそのまま設定 YAML と `testdata/` のフィクスチャに落とす。
+## 未決事項（決着済み）
 
-## 未決事項
-
-- 累積 DB のバックアップ方法（正史なので消えると痛い。既存のバックアップ対象に含めるか）
-- 種別ごとの窓の具体値（実物のデータ量を見てから決める）
-- スプレッドシートのセル上限（1シート1000万セル）に到達した場合の扱い
+- **累積 DB のバックアップ方法** → [ADR 0003](../adr/0003-relative-data-volume-path.md) で決めた `./data` の mini-pc-setup 側バックアップに乗る。本リポジトリでは追加対応しない
+- **種別ごとの窓の具体値** → 実データの件数を確認して確定した（血圧・心拍・睡眠は `all`、歩数は `30d`）。根拠は調査結果の件数
+- **スプレッドシートのセル上限** → `daily_summary` は1日1行なので到達しない。生データタブは窓で抑える。到達した場合は窓を縮める運用で対応し、コードでは扱わない
