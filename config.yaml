@@ -36,3 +36,99 @@ types:
         column: count
     window: 30d
     daily: [sum]
+
+  weight:
+    source_table: weight_record_table
+    time_layout: instant
+    columns:
+      kg:
+        column: weight
+        scale: 0.001
+    window: all
+    daily: [mean, min, max, count]
+
+  body_fat:
+    source_table: body_fat_record_table
+    time_layout: instant
+    columns:
+      percent:
+        column: percentage
+    window: all
+    daily: [mean, min, max, count]
+
+  basal_metabolic_rate:
+    source_table: basal_metabolic_rate_record_table
+    time_layout: instant
+    columns:
+      kcal_per_day:
+        column: basal_metabolic_rate
+        scale: 20.65
+    window: all
+    daily: [mean, count]
+
+  height:
+    source_table: height_record_table
+    time_layout: instant
+    columns:
+      cm:
+        column: height
+        scale: 100
+    window: all
+    daily: [mean, count]
+
+  resting_heart_rate:
+    source_table: resting_heart_rate_record_table
+    time_layout: instant
+    columns:
+      bpm:
+        column: beats_per_minute
+    window: all
+    daily: [mean, min, max, count]
+
+  oxygen_saturation:
+    source_table: oxygen_saturation_record_table
+    time_layout: instant
+    columns:
+      percent:
+        column: percentage
+    window: all
+    daily: [mean, min, max, count]
+
+  distance:
+    source_table: distance_record_table
+    time_layout: interval
+    columns:
+      m:
+        column: distance
+    window: 30d
+    daily: [sum]
+
+  total_calories_burned:
+    source_table: total_calories_burned_record_table
+    time_layout: interval
+    columns:
+      kcal:
+        column: energy
+        scale: 0.001
+    window: all
+    daily: [sum]
+
+  exercise_session:
+    source_table: exercise_session_record_table
+    time_layout: interval
+    columns:
+      rpe:
+        column: session_rate_of_perceived_exertion
+    include_duration: true
+    window: all
+    daily: [sum, count]
+
+  speed:
+    source_table: SpeedRecordTable
+    time_layout: series
+    series_table: speed_record_table
+    columns:
+      m_per_s:
+        column: speed
+    window: 30d
+    daily: [mean, max, count]

@@ -61,6 +61,16 @@ func newFixtureDB(t *testing.T) string {
 		`CREATE TABLE hc_series_child (
 			parent_key INTEGER, epoch_millis INTEGER, beats_per_minute INTEGER
 		)`,
+		// エクスポートDBが series の親テーブルの一部を CamelCase で命名すること
+		// （例: SpeedRecordTable）を再現するフィクスチャ。
+		`CREATE TABLE CamelSeriesParent (
+			uuid BLOB, start_time INTEGER, start_zone_offset INTEGER,
+			end_time INTEGER, end_zone_offset INTEGER, app_info_id INTEGER,
+			row_id INTEGER PRIMARY KEY
+		)`,
+		`CREATE TABLE camel_series_child (
+			parent_key INTEGER, epoch_millis INTEGER, speed REAL
+		)`,
 	}
 	for _, stmt := range ddl {
 		if _, err := db.Exec(stmt); err != nil {
@@ -94,6 +104,10 @@ func newFixtureDB(t *testing.T) string {
 	exec(`INSERT INTO hc_series_child (parent_key, epoch_millis, beats_per_minute) VALUES (1, 2000, 65)`)
 	exec(`INSERT INTO hc_series_child (parent_key, epoch_millis, beats_per_minute) VALUES (1, 3000, 70)`)
 
+	exec(`INSERT INTO CamelSeriesParent (uuid, start_time, start_zone_offset, end_time, end_zone_offset, app_info_id, row_id)
+		VALUES (?, 1000, 32400, 4000, 32400, 1, 1)`, mustDecodeHex(t, parentUUIDHex))
+	exec(`INSERT INTO camel_series_child (parent_key, epoch_millis, speed) VALUES (1, 1000, 1.5)`)
+
 	return path
 }
 
@@ -125,6 +139,17 @@ func seriesTypeConfig() config.TypeConfig {
 		SeriesTable: "hc_series_child",
 		Columns: map[string]config.ColumnConfig{
 			"bpm": {Column: "beats_per_minute", Scale: 1},
+		},
+	}
+}
+
+func camelSeriesTypeConfig() config.TypeConfig {
+	return config.TypeConfig{
+		SourceTable: "CamelSeriesParent",
+		TimeLayout:  config.LayoutSeries,
+		SeriesTable: "camel_series_child",
+		Columns: map[string]config.ColumnConfig{
+			"speed": {Column: "speed", Scale: 1},
 		},
 	}
 }
@@ -324,6 +349,23 @@ func TestReadDB_MissingSeriesTable_ReturnsEmptySliceNoError(t *testing.T) {
 }
 
 // --- 識別子検証（SQLインジェクション対策） ---
+
+func TestReadDB_Series_CamelCaseSourceTable(t *testing.T) {
+	dbPath := newFixtureDB(t)
+	cfg := &config.Config{Types: map[string]config.TypeConfig{"camel_series_type": camelSeriesTypeConfig()}}
+
+	got, err := ReadDB(dbPath, cfg)
+	if err != nil {
+		t.Fatalf("ReadDB: %v", err)
+	}
+	recs, ok := got["camel_series_type"]
+	if !ok || len(recs) != 1 {
+		t.Fatalf("expected 1 record for camel_series_type, got %+v", got["camel_series_type"])
+	}
+	if recs[0].Values["speed"] != 1.5 {
+		t.Errorf("speed = %v, want 1.5", recs[0].Values["speed"])
+	}
+}
 
 func TestReadDB_InvalidSourceTable_Errors(t *testing.T) {
 	dbPath := newFixtureDB(t)
