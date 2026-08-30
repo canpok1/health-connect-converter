@@ -3,7 +3,6 @@ services:
     image: ghcr.io/canpok1/health-connect-converter:latest
     pull_policy: always
     restart: unless-stopped
-    user: "${HC_UID:?HC_UID is required}:${HC_GID:?HC_GID is required}"
     environment:
       TZ: Asia/Tokyo
       HC_POLL_INTERVAL: "${HC_POLL_INTERVAL:-1h}"
