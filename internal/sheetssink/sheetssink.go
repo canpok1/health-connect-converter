@@ -16,12 +16,22 @@ import (
 // maxRowsPerRequest は spreadsheets.values.update 1回あたりに送る最大行数。
 const maxRowsPerRequest = 5000
 
+// defaultGridCols は新規タブの列数の下限。Google Sheets のデフォルトタブ幅に合わせる。
+const defaultGridCols = 26
+
+// sheetMeta はキャッシュ済みのタブのID・現在のグリッドサイズ。
+type sheetMeta struct {
+	id   int64
+	rows int64
+	cols int64
+}
+
 // Sink は1個の既存スプレッドシートのタブへ行を書き込む。
 type Sink struct {
 	svc           *sheets.Service
 	spreadsheetID string
-	sheetTitles   map[string]bool
-	titlesLoaded  bool
+	sheets        map[string]sheetMeta
+	loaded        bool
 }
 
 // New はサービスアカウント鍵で認証済みの Sink を作る。
@@ -42,22 +52,33 @@ func newWithService(svc *sheets.Service, spreadsheetID string) *Sink {
 	return &Sink{
 		svc:           svc,
 		spreadsheetID: spreadsheetID,
-		sheetTitles:   make(map[string]bool),
+		sheets:        make(map[string]sheetMeta),
 	}
 }
 
 // WriteTab は title という名前のタブへ rows を書く。タブが無ければ作り、
 // 書く前に既存内容を全消しする。rows が空でもタブの作成・全消しは行う。
+//
+// values.update はグリッドの範囲外への書き込みを自動拡張しない（実機検証で
+// 確認済み：既定サイズのタブへ5000行超を書くと2チャンク目以降が
+// "exceeds grid limits" で失敗する）。そのため書き込み前に必要な行数・列数を
+// 自分で計算し、グリッドが足りなければ明示的にリサイズする。
 func (s *Sink) WriteTab(ctx context.Context, title string, rows [][]any) error {
-	if err := s.ensureTitlesLoaded(ctx); err != nil {
+	if err := s.ensureLoaded(ctx); err != nil {
 		return err
 	}
 
-	if !s.sheetTitles[title] {
-		if err := s.addSheet(ctx, title); err != nil {
+	meta, exists := s.sheets[title]
+	if !exists {
+		var err error
+		meta, err = s.addSheet(ctx, title, neededRows(rows), neededCols(rows))
+		if err != nil {
 			return err
 		}
+	} else if err := s.growIfNeeded(ctx, title, &meta, neededRows(rows), neededCols(rows)); err != nil {
+		return err
 	}
+	s.sheets[title] = meta
 
 	quotedTitle := quoteSheetTitle(title)
 
@@ -83,45 +104,119 @@ func (s *Sink) WriteTab(ctx context.Context, title string, rows [][]any) error {
 	return nil
 }
 
-// ensureTitlesLoaded は既存タブ名を初回だけ取得しキャッシュする。
-func (s *Sink) ensureTitlesLoaded(ctx context.Context) error {
-	if s.titlesLoaded {
+// neededRows は書き込みに必要な行数。0行のときも既存グリッドを壊さないよう
+// 最低1を返す。
+func neededRows(rows [][]any) int64 {
+	if len(rows) == 0 {
+		return 1
+	}
+	return int64(len(rows))
+}
+
+// neededCols は書き込みに必要な列数。全行の中で最大の列数を採る
+// （通常はヘッダ行と一致する）。
+func neededCols(rows [][]any) int64 {
+	var max int64
+	for _, r := range rows {
+		if n := int64(len(r)); n > max {
+			max = n
+		}
+	}
+	if max < defaultGridCols {
+		return defaultGridCols
+	}
+	return max
+}
+
+// ensureLoaded は既存タブのID・グリッドサイズを初回だけ取得しキャッシュする。
+func (s *Sink) ensureLoaded(ctx context.Context) error {
+	if s.loaded {
 		return nil
 	}
 
 	spreadsheet, err := s.svc.Spreadsheets.Get(s.spreadsheetID).
-		Fields("sheets(properties(title))").
+		Fields("sheets(properties(sheetId,title,gridProperties(rowCount,columnCount)))").
 		Context(ctx).Do()
 	if err != nil {
 		return fmt.Errorf("sheetssink: get spreadsheet: %w", err)
 	}
 
 	for _, sh := range spreadsheet.Sheets {
-		if sh.Properties != nil {
-			s.sheetTitles[sh.Properties.Title] = true
+		if sh.Properties == nil {
+			continue
 		}
+		meta := sheetMeta{id: sh.Properties.SheetId}
+		if gp := sh.Properties.GridProperties; gp != nil {
+			meta.rows = gp.RowCount
+			meta.cols = gp.ColumnCount
+		}
+		s.sheets[sh.Properties.Title] = meta
 	}
-	s.titlesLoaded = true
+	s.loaded = true
 	return nil
 }
 
-// addSheet は title という名前のタブを新規作成し、成功したらキャッシュへ足す。
-func (s *Sink) addSheet(ctx context.Context, title string) error {
+// addSheet は title という名前のタブを rows x cols のグリッドで新規作成し、
+// 成功したらキャッシュへ足す。
+func (s *Sink) addSheet(ctx context.Context, title string, rows, cols int64) (sheetMeta, error) {
 	req := &sheets.BatchUpdateSpreadsheetRequest{
 		Requests: []*sheets.Request{
 			{
 				AddSheet: &sheets.AddSheetRequest{
-					Properties: &sheets.SheetProperties{Title: title},
+					Properties: &sheets.SheetProperties{
+						Title:          title,
+						GridProperties: &sheets.GridProperties{RowCount: rows, ColumnCount: cols},
+					},
 				},
 			},
 		},
 	}
 
-	if _, err := s.svc.Spreadsheets.BatchUpdate(s.spreadsheetID, req).Context(ctx).Do(); err != nil {
-		return fmt.Errorf("sheetssink: add sheet %q: %w", title, err)
+	resp, err := s.svc.Spreadsheets.BatchUpdate(s.spreadsheetID, req).Context(ctx).Do()
+	if err != nil {
+		return sheetMeta{}, fmt.Errorf("sheetssink: add sheet %q: %w", title, err)
+	}
+	if len(resp.Replies) == 0 || resp.Replies[0].AddSheet == nil || resp.Replies[0].AddSheet.Properties == nil {
+		// sheetId が取れないと後続のリサイズが別タブ（ID 0）を誤って
+		// 更新しうるため、0埋めせず即エラーにする。
+		return sheetMeta{}, fmt.Errorf("sheetssink: add sheet %q: response missing sheetId", title)
 	}
 
-	s.sheetTitles[title] = true
+	return sheetMeta{
+		id:   resp.Replies[0].AddSheet.Properties.SheetId,
+		rows: rows,
+		cols: cols,
+	}, nil
+}
+
+// growIfNeeded はタブの現在のグリッドが rows x cols に満たなければ拡張する。
+// 縮小はしない。
+func (s *Sink) growIfNeeded(ctx context.Context, title string, meta *sheetMeta, rows, cols int64) error {
+	newRows := max(meta.rows, rows)
+	newCols := max(meta.cols, cols)
+	if newRows == meta.rows && newCols == meta.cols {
+		return nil
+	}
+
+	req := &sheets.BatchUpdateSpreadsheetRequest{
+		Requests: []*sheets.Request{
+			{
+				UpdateSheetProperties: &sheets.UpdateSheetPropertiesRequest{
+					Properties: &sheets.SheetProperties{
+						SheetId:        meta.id,
+						GridProperties: &sheets.GridProperties{RowCount: newRows, ColumnCount: newCols},
+					},
+					Fields: "gridProperties.rowCount,gridProperties.columnCount",
+				},
+			},
+		},
+	}
+	if _, err := s.svc.Spreadsheets.BatchUpdate(s.spreadsheetID, req).Context(ctx).Do(); err != nil {
+		return fmt.Errorf("sheetssink: resize tab %q: %w", title, err)
+	}
+
+	meta.rows = newRows
+	meta.cols = newCols
 	return nil
 }
 

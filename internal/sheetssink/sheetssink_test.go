@@ -3,9 +3,13 @@ package sheetssink
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -24,19 +28,48 @@ type recordedCall struct {
 	body   []byte
 }
 
+// fakeSheet はフェイクAPI内で管理する1タブぶんの状態。
+type fakeSheet struct {
+	id   int64
+	rows int64
+	cols int64
+}
+
 // fakeSheetsAPI は Google Sheets API を模したインメモリのフェイク。
-// 既存タブ名と受けたリクエストをすべて記録する。
+// 実機で確認した「values.update はグリッド範囲外への書き込みを自動拡張
+// しない」という挙動を再現するため、書き込み範囲がタブの現在の
+// グリッドサイズを超えたら本物のAPIと同じ400エラーを返す。
 type fakeSheetsAPI struct {
 	mu           sync.Mutex
 	calls        []recordedCall
-	titles       map[string]bool
+	sheets       map[string]*fakeSheet
+	nextID       int64
 	failAddSheet bool
 }
 
-func newFakeSheetsAPI(initialTitles []string, failAddSheet bool) *fakeSheetsAPI {
-	f := &fakeSheetsAPI{titles: make(map[string]bool), failAddSheet: failAddSheet}
-	for _, title := range initialTitles {
-		f.titles[title] = true
+// newFakeSheetsAPI は既存タブを Google Sheets の新規タブ既定サイズ
+// （1000行 x 26列）で登録する。
+func newFakeSheetsAPI(titles []string, failAddSheet bool) *fakeSheetsAPI {
+	grids := make(map[string]fakeSheet, len(titles))
+	for _, title := range titles {
+		grids[title] = fakeSheet{rows: 1000, cols: 26}
+	}
+	return newFakeSheetsAPIWithGrids(grids, failAddSheet)
+}
+
+// newFakeSheetsAPIWithGrids はタブごとのグリッドサイズを指定して登録する。
+// growIfNeeded のリサイズ挙動や、グリッド超過エラーの再現に使う。
+func newFakeSheetsAPIWithGrids(grids map[string]fakeSheet, failAddSheet bool) *fakeSheetsAPI {
+	f := &fakeSheetsAPI{sheets: make(map[string]*fakeSheet), nextID: 1, failAddSheet: failAddSheet}
+	for title, g := range grids {
+		grid := g
+		if grid.id == 0 {
+			grid.id = f.nextID
+		}
+		if grid.id >= f.nextID {
+			f.nextID = grid.id + 1
+		}
+		f.sheets[title] = &grid
 	}
 	return f
 }
@@ -57,6 +90,16 @@ func (f *fakeSheetsAPI) countMatching(pred func(recordedCall) bool) int {
 		}
 	}
 	return n
+}
+
+func (f *fakeSheetsAPI) gridOf(title string) (fakeSheet, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	g, ok := f.sheets[title]
+	if !ok {
+		return fakeSheet{}, false
+	}
+	return *g, true
 }
 
 func (f *fakeSheetsAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -81,7 +124,7 @@ func (f *fakeSheetsAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case strings.HasSuffix(r.URL.Path, ":clear"):
 		_ = json.NewEncoder(w).Encode(map[string]any{})
 	case r.Method == http.MethodPut:
-		_ = json.NewEncoder(w).Encode(map[string]any{})
+		f.handleValuesUpdate(w, r, body)
 	default:
 		w.WriteHeader(http.StatusNotFound)
 	}
@@ -89,14 +132,44 @@ func (f *fakeSheetsAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (f *fakeSheetsAPI) handleGet(w http.ResponseWriter) {
 	f.mu.Lock()
-	sheetsList := make([]map[string]any, 0, len(f.titles))
-	for title := range f.titles {
+	sheetsList := make([]map[string]any, 0, len(f.sheets))
+	for title, g := range f.sheets {
 		sheetsList = append(sheetsList, map[string]any{
-			"properties": map[string]any{"title": title},
+			"properties": map[string]any{
+				"sheetId": g.id,
+				"title":   title,
+				"gridProperties": map[string]any{
+					"rowCount":    g.rows,
+					"columnCount": g.cols,
+				},
+			},
 		})
 	}
 	f.mu.Unlock()
 	_ = json.NewEncoder(w).Encode(map[string]any{"sheets": sheetsList})
+}
+
+type batchUpdateRequest struct {
+	Requests []struct {
+		AddSheet *struct {
+			Properties struct {
+				Title          string `json:"title"`
+				GridProperties struct {
+					RowCount    int64 `json:"rowCount"`
+					ColumnCount int64 `json:"columnCount"`
+				} `json:"gridProperties"`
+			} `json:"properties"`
+		} `json:"addSheet"`
+		UpdateSheetProperties *struct {
+			Properties struct {
+				SheetID        int64 `json:"sheetId"`
+				GridProperties struct {
+					RowCount    int64 `json:"rowCount"`
+					ColumnCount int64 `json:"columnCount"`
+				} `json:"gridProperties"`
+			} `json:"properties"`
+		} `json:"updateSheetProperties"`
+	} `json:"requests"`
 }
 
 func (f *fakeSheetsAPI) handleBatchUpdate(w http.ResponseWriter, body []byte) {
@@ -108,26 +181,99 @@ func (f *fakeSheetsAPI) handleBatchUpdate(w http.ResponseWriter, body []byte) {
 		return
 	}
 
-	var req struct {
-		Requests []struct {
-			AddSheet *struct {
-				Properties struct {
-					Title string `json:"title"`
-				} `json:"properties"`
-			} `json:"addSheet"`
-		} `json:"requests"`
-	}
+	var req batchUpdateRequest
 	_ = json.Unmarshal(body, &req)
 
 	f.mu.Lock()
+	var addedID int64
 	for _, rq := range req.Requests {
 		if rq.AddSheet != nil {
-			f.titles[rq.AddSheet.Properties.Title] = true
+			id := f.nextID
+			f.nextID++
+			f.sheets[rq.AddSheet.Properties.Title] = &fakeSheet{
+				id:   id,
+				rows: rq.AddSheet.Properties.GridProperties.RowCount,
+				cols: rq.AddSheet.Properties.GridProperties.ColumnCount,
+			}
+			addedID = id
+		}
+		if rq.UpdateSheetProperties != nil {
+			for _, g := range f.sheets {
+				if g.id == rq.UpdateSheetProperties.Properties.SheetID {
+					g.rows = rq.UpdateSheetProperties.Properties.GridProperties.RowCount
+					g.cols = rq.UpdateSheetProperties.Properties.GridProperties.ColumnCount
+				}
+			}
 		}
 	}
 	f.mu.Unlock()
 
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"replies": []map[string]any{{
+			"addSheet": map[string]any{"properties": map[string]any{"sheetId": addedID}},
+		}},
+	})
+}
+
+var rangeRe = regexp.MustCompile(`^(.*)!A(\d+)$`)
+
+// handleValuesUpdate は本物の Sheets API と同じく、書き込み範囲がタブの
+// 現在のグリッドサイズを超えていたら 400 を返す（自動拡張しない）。
+func (f *fakeSheetsAPI) handleValuesUpdate(w http.ResponseWriter, r *http.Request, body []byte) {
+	rangeParam := strings.TrimPrefix(r.URL.Path, "/v4/spreadsheets/"+testSpreadsheetID+"/values/")
+	decoded, err := url.QueryUnescape(rangeParam)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	var payload struct {
+		Values [][]any `json:"values"`
+	}
+	_ = json.Unmarshal(body, &payload)
+
+	title, startRow := parseRange(decoded)
+	grid, ok := f.gridOf(title)
+	if !ok {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+
+	endRow := startRow + int64(len(payload.Values)) - 1
+	var maxCols int64
+	for _, row := range payload.Values {
+		if n := int64(len(row)); n > maxCols {
+			maxCols = n
+		}
+	}
+	if endRow > grid.rows || maxCols > grid.cols {
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"error": map[string]any{
+				"code": 400,
+				"message": fmt.Sprintf(
+					"Range (%s) exceeds grid limits. Max rows: %d, max columns: %d",
+					decoded, grid.rows, grid.cols,
+				),
+			},
+		})
+		return
+	}
+
 	_ = json.NewEncoder(w).Encode(map[string]any{})
+}
+
+// parseRange は "'title'!A123" 形式から title（クォート・エスケープ解除済み）
+// と開始行番号を取り出す。
+func parseRange(rangeStr string) (title string, startRow int64) {
+	m := rangeRe.FindStringSubmatch(rangeStr)
+	if m == nil {
+		return "", 0
+	}
+	title = strings.TrimSuffix(strings.TrimPrefix(m[1], "'"), "'")
+	title = strings.ReplaceAll(title, "''", "'")
+	n, _ := strconv.ParseInt(m[2], 10, 64)
+	return title, n
 }
 
 // newTestSink は fake を backend にした httptest サーバーへ Sink を繋ぐ。
@@ -196,6 +342,27 @@ func TestWriteTab_CreatesSheetWhenMissing(t *testing.T) {
 	}
 }
 
+func TestWriteTab_NewSheetIsSizedForData(t *testing.T) {
+	fake := newFakeSheetsAPI(nil, false)
+	sink := newTestSink(t, fake)
+
+	rows := make([][]any, 6000)
+	for i := range rows {
+		rows[i] = []any{i}
+	}
+	if err := sink.WriteTab(context.Background(), "steps_raw", rows); err != nil {
+		t.Fatalf("WriteTab: %v", err)
+	}
+
+	grid, ok := fake.gridOf("steps_raw")
+	if !ok {
+		t.Fatal("steps_raw not found")
+	}
+	if grid.rows < 6000 {
+		t.Errorf("grid.rows = %d, want >= 6000", grid.rows)
+	}
+}
+
 func TestWriteTab_ExistingSheetSkipsAddSheet(t *testing.T) {
 	fake := newFakeSheetsAPI([]string{"existing_tab"}, false)
 	sink := newTestSink(t, fake)
@@ -212,6 +379,73 @@ func TestWriteTab_ExistingSheetSkipsAddSheet(t *testing.T) {
 	}
 	if n := fake.countMatching(isUpdate); n != 1 {
 		t.Fatalf("update called %d times, want 1", n)
+	}
+}
+
+func TestWriteTab_GrowsExistingSheetWhenTooSmall(t *testing.T) {
+	fake := newFakeSheetsAPIWithGrids(map[string]fakeSheet{
+		"steps_raw": {rows: 1000, cols: 26},
+	}, false)
+	sink := newTestSink(t, fake)
+
+	rows := make([][]any, 6000)
+	for i := range rows {
+		rows[i] = []any{i}
+	}
+	if err := sink.WriteTab(context.Background(), "steps_raw", rows); err != nil {
+		t.Fatalf("WriteTab: %v", err)
+	}
+
+	if n := fake.countMatching(isBatchUpdate); n != 1 {
+		t.Fatalf("batchUpdate called %d times, want 1 (resize)", n)
+	}
+	grid, _ := fake.gridOf("steps_raw")
+	if grid.rows < 6000 {
+		t.Errorf("grid.rows = %d, want >= 6000 after grow", grid.rows)
+	}
+}
+
+func TestWriteTab_NoResizeWhenGridAlreadyBigEnough(t *testing.T) {
+	fake := newFakeSheetsAPIWithGrids(map[string]fakeSheet{
+		"existing_tab": {rows: 10000, cols: 26},
+	}, false)
+	sink := newTestSink(t, fake)
+
+	if err := sink.WriteTab(context.Background(), "existing_tab", [][]any{{"a"}}); err != nil {
+		t.Fatalf("WriteTab: %v", err)
+	}
+
+	if n := fake.countMatching(isBatchUpdate); n != 0 {
+		t.Fatalf("batchUpdate called %d times, want 0 (no resize needed)", n)
+	}
+}
+
+func TestWriteTab_WithoutResizeWouldFailAboveDefaultGrid(t *testing.T) {
+	// リグレッション用の対照実験: リサイズをせずに1000行の既定グリッドへ
+	// 5000行超を書こうとすると、フェイクAPIが本物と同じ400を返すことを
+	// 確認する（=フェイクの模倣が正しいこと、かつ本番コードは常に事前リサイズ
+	// するためこのエラーに到達しないことの裏付け）。
+	fake := newFakeSheetsAPIWithGrids(map[string]fakeSheet{"t": {rows: 1000, cols: 26}}, false)
+	srv := httptest.NewServer(fake)
+	defer srv.Close()
+
+	svc, err := sheets.NewService(context.Background(),
+		option.WithEndpoint(srv.URL),
+		option.WithoutAuthentication(),
+		option.WithHTTPClient(srv.Client()),
+	)
+	if err != nil {
+		t.Fatalf("sheets.NewService: %v", err)
+	}
+
+	rows := make([][]any, 1500)
+	for i := range rows {
+		rows[i] = []any{i}
+	}
+	_, err = svc.Spreadsheets.Values.Update(testSpreadsheetID, "'t'!A1", &sheets.ValueRange{Values: rows}).
+		ValueInputOption("RAW").Do()
+	if err == nil {
+		t.Fatal("want error writing beyond grid limit without resize, got nil")
 	}
 }
 
@@ -325,7 +559,7 @@ func TestWriteTab_AddSheetErrorNotCached(t *testing.T) {
 		t.Fatal("WriteTab: want error, got nil")
 	}
 
-	if sink.sheetTitles["failing_tab"] {
+	if _, cached := sink.sheets["failing_tab"]; cached {
 		t.Fatal("failing_tab should not be cached after addSheet error")
 	}
 	if n := fake.countMatching(isClear); n != 0 {
