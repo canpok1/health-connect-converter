@@ -4,12 +4,14 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"slices"
 	"sync"
 	"testing"
 	"time"
 
 	"health-connect-converter/internal/config"
 	"health-connect-converter/internal/model"
+	"health-connect-converter/internal/report"
 )
 
 // --- フェイク ---
@@ -109,9 +111,11 @@ type writeTabCall struct {
 }
 
 type fakeSink struct {
-	err        error
-	errOnTitle string // 空なら全タイトルでエラー
-	calls      []writeTabCall
+	err          error
+	errOnTitle   string // 空なら全タイトルでエラー
+	moveErr      error
+	calls        []writeTabCall
+	moveTabCalls []string
 }
 
 func (f *fakeSink) WriteTab(_ context.Context, title string, rows [][]any) error {
@@ -120,6 +124,11 @@ func (f *fakeSink) WriteTab(_ context.Context, title string, rows [][]any) error
 		return f.err
 	}
 	return nil
+}
+
+func (f *fakeSink) MoveTabFirst(_ context.Context, title string) error {
+	f.moveTabCalls = append(f.moveTabCalls, title)
+	return f.moveErr
 }
 
 // logCapture はテストでログ出力内容を検証するための slog.Handler。
@@ -217,6 +226,58 @@ func TestRunOnce_NoNewFile_NoOtherCalls(t *testing.T) {
 	if len(sink.calls) != 0 {
 		t.Errorf("Sink.WriteTab calls = %d, want 0", len(sink.calls))
 	}
+	if len(st.setStateCalls) != 0 {
+		t.Errorf("SetState calls = %d, want 0", len(st.setStateCalls))
+	}
+
+	// タブ順の是正だけは新着の有無によらず行う。
+	if want := []string{report.DailySummaryTitle}; !slices.Equal(sink.moveTabCalls, want) {
+		t.Errorf("Sink.MoveTabFirst calls = %v, want %v", sink.moveTabCalls, want)
+	}
+}
+
+// 人手で先頭にシートを挿入されても、新着ZIPを待たずに次の周回で是正する。
+func TestRunOnce_NoNewFile_MoveTabFirstFails(t *testing.T) {
+	src := &fakeSource{zip: nil}
+	st := newFakeStore()
+	sink := &fakeSink{moveErr: errors.New("boom")}
+
+	a := New(testConfig(), src, &fakeReader{}, st, sink, discardLogger(), nil)
+	if err := a.RunOnce(context.Background()); err == nil {
+		t.Fatal("RunOnce() error = nil, want error")
+	}
+}
+
+func TestRunOnce_MovesDailySummaryFirstAfterWriting(t *testing.T) {
+	src := &fakeSource{zip: &model.ZipFile{FileID: "f1", ModifiedTime: time.Now()}}
+	st := newFakeStore()
+	sink := &fakeSink{}
+
+	a := New(testConfig(), src, &fakeReader{}, st, sink, discardLogger(), nil)
+	if err := a.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce() error = %v", err)
+	}
+
+	if want := []string{report.DailySummaryTitle}; !slices.Equal(sink.moveTabCalls, want) {
+		t.Fatalf("Sink.MoveTabFirst calls = %v, want %v", sink.moveTabCalls, want)
+	}
+	// タブを作る前に移動しても意味がないため、書き込みの後でなければならない。
+	if len(sink.calls) == 0 {
+		t.Fatal("WriteTab was not called")
+	}
+}
+
+// 是正に失敗したら state を進めない。次の周回で同じZIPを取り直して再試行する。
+func TestRunOnce_MoveTabFirstFails_NoStateUpdate(t *testing.T) {
+	src := &fakeSource{zip: &model.ZipFile{FileID: "f1", ModifiedTime: time.Now()}}
+	st := newFakeStore()
+	sink := &fakeSink{moveErr: errors.New("boom")}
+
+	a := New(testConfig(), src, &fakeReader{}, st, sink, discardLogger(), nil)
+	if err := a.RunOnce(context.Background()); err == nil {
+		t.Fatal("RunOnce() error = nil, want error")
+	}
+
 	if len(st.setStateCalls) != 0 {
 		t.Errorf("SetState calls = %d, want 0", len(st.setStateCalls))
 	}
