@@ -10,3 +10,4 @@
 | [0004](0004-config-driven-generic-records.md) | 種別を汎用レコードで扱い、累積DBのスキーマをconfig.yamlから生成する | 採用 | 2026-08-29 |
 | [0005](0005-deployment-identifiers-via-env-file.md) | デプロイ固有の識別子は.envの環境変数で渡す | 採用 | 2026-08-29 |
 | [0006](0006-fix-container-uid-to-1000.md) | コンテナの実行UID/GIDをplant-diaryに合わせて固定する | 採用 | 2026-08-30 |
+| [0007](0007-daily-summary-as-first-tab.md) | Claudeに読ませる正本としてdaily_summaryを先頭タブに固定する | 採用 | 2026-08-30 |
