@@ -21,10 +21,16 @@ import (
 	"health-connect-converter/internal/model"
 )
 
-// identifierRe は source_table/series_table/column をSQLへ文字列連結する前の検証に使う。
-// これらはプレースホルダに置けない識別子であり、未検証のまま埋め込むとSQLインジェクションに
-// つながるため、config側の検証有無に関わらずここでも通す。
+// identifierRe は column をSQLへ文字列連結する前の検証に使う。プレースホルダに
+// 置けない識別子であり、未検証のまま埋め込むとSQLインジェクションにつながるため、
+// config側の検証有無に関わらずここでも通す。
 var identifierRe = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
+
+// tableNameRe は source_table/series_table の検証に使う。エクスポートDBは series
+// レコードの親テーブルの一部を CamelCase で命名している（例: SpeedRecordTable）ため、
+// 列名用の identifierRe より大文字を許す。空白・引用符・セミコロンは引き続き弾かれる
+// ため、SQLインジェクション対策としての機能は変わらない。
+var tableNameRe = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_]*$`)
 
 // Reader は internal/app の Reader インターフェースを満たす。
 type Reader struct {
@@ -117,7 +123,7 @@ func ReadDB(dbPath string, cfg *config.Config) (map[string][]model.Record, error
 }
 
 func readType(db *sql.DB, tc config.TypeConfig) ([]model.Record, error) {
-	if err := validateIdentifier(tc.SourceTable); err != nil {
+	if err := validateTableName(tc.SourceTable); err != nil {
 		return nil, err
 	}
 
@@ -127,7 +133,7 @@ func readType(db *sql.DB, tc config.TypeConfig) ([]model.Record, error) {
 	case config.LayoutInterval:
 		return readInterval(db, tc)
 	case config.LayoutSeries:
-		if err := validateIdentifier(tc.SeriesTable); err != nil {
+		if err := validateTableName(tc.SeriesTable); err != nil {
 			return nil, err
 		}
 		return readSeries(db, tc)
@@ -361,6 +367,13 @@ func valueColumns(tc config.TypeConfig, names []string) ([]string, error) {
 func validateIdentifier(name string) error {
 	if !identifierRe.MatchString(name) {
 		return fmt.Errorf("hcreader: invalid identifier %q (must match %s)", name, identifierRe.String())
+	}
+	return nil
+}
+
+func validateTableName(name string) error {
+	if !tableNameRe.MatchString(name) {
+		return fmt.Errorf("hcreader: invalid table name %q (must match %s)", name, tableNameRe.String())
 	}
 	return nil
 }
