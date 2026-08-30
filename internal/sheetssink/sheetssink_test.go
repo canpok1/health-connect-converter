@@ -9,6 +9,8 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"regexp"
+	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -30,9 +32,10 @@ type recordedCall struct {
 
 // fakeSheet はフェイクAPI内で管理する1タブぶんの状態。
 type fakeSheet struct {
-	id   int64
-	rows int64
-	cols int64
+	id    int64
+	rows  int64
+	cols  int64
+	index int64
 }
 
 // fakeSheetsAPI は Google Sheets API を模したインメモリのフェイク。
@@ -51,8 +54,8 @@ type fakeSheetsAPI struct {
 // （1000行 x 26列）で登録する。
 func newFakeSheetsAPI(titles []string, failAddSheet bool) *fakeSheetsAPI {
 	grids := make(map[string]fakeSheet, len(titles))
-	for _, title := range titles {
-		grids[title] = fakeSheet{rows: 1000, cols: 26}
+	for i, title := range titles {
+		grids[title] = fakeSheet{rows: 1000, cols: 26, index: int64(i)}
 	}
 	return newFakeSheetsAPIWithGrids(grids, failAddSheet)
 }
@@ -138,6 +141,7 @@ func (f *fakeSheetsAPI) handleGet(w http.ResponseWriter) {
 			"properties": map[string]any{
 				"sheetId": g.id,
 				"title":   title,
+				"index":   g.index,
 				"gridProperties": map[string]any{
 					"rowCount":    g.rows,
 					"columnCount": g.cols,
@@ -162,12 +166,14 @@ type batchUpdateRequest struct {
 		} `json:"addSheet"`
 		UpdateSheetProperties *struct {
 			Properties struct {
-				SheetID        int64 `json:"sheetId"`
-				GridProperties struct {
+				SheetID        int64  `json:"sheetId"`
+				Index          *int64 `json:"index"`
+				GridProperties *struct {
 					RowCount    int64 `json:"rowCount"`
 					ColumnCount int64 `json:"columnCount"`
 				} `json:"gridProperties"`
 			} `json:"properties"`
+			Fields string `json:"fields"`
 		} `json:"updateSheetProperties"`
 	} `json:"requests"`
 }
@@ -191,18 +197,25 @@ func (f *fakeSheetsAPI) handleBatchUpdate(w http.ResponseWriter, body []byte) {
 			id := f.nextID
 			f.nextID++
 			f.sheets[rq.AddSheet.Properties.Title] = &fakeSheet{
-				id:   id,
-				rows: rq.AddSheet.Properties.GridProperties.RowCount,
-				cols: rq.AddSheet.Properties.GridProperties.ColumnCount,
+				id:    id,
+				rows:  rq.AddSheet.Properties.GridProperties.RowCount,
+				cols:  rq.AddSheet.Properties.GridProperties.ColumnCount,
+				index: int64(len(f.sheets)),
 			}
 			addedID = id
 		}
 		if rq.UpdateSheetProperties != nil {
-			for _, g := range f.sheets {
-				if g.id == rq.UpdateSheetProperties.Properties.SheetID {
-					g.rows = rq.UpdateSheetProperties.Properties.GridProperties.RowCount
-					g.cols = rq.UpdateSheetProperties.Properties.GridProperties.ColumnCount
+			p := rq.UpdateSheetProperties.Properties
+			if p.GridProperties != nil {
+				for _, g := range f.sheets {
+					if g.id == p.SheetID {
+						g.rows = p.GridProperties.RowCount
+						g.cols = p.GridProperties.ColumnCount
+					}
 				}
+			}
+			if p.Index != nil {
+				f.moveSheetLocked(p.SheetID, *p.Index)
 			}
 		}
 	}
@@ -213,6 +226,63 @@ func (f *fakeSheetsAPI) handleBatchUpdate(w http.ResponseWriter, body []byte) {
 			"addSheet": map[string]any{"properties": map[string]any{"sheetId": addedID}},
 		}},
 	})
+}
+
+// moveSheetLocked は sheetID のタブを newIndex へ移し、残りの index を詰め直す。
+// 本物の Sheets API と同じく、タブ順は 0 から隙間なく振り直される。
+// 呼び出し側が f.mu を保持していること。
+func (f *fakeSheetsAPI) moveSheetLocked(sheetID, newIndex int64) {
+	ordered := make([]*fakeSheet, 0, len(f.sheets))
+	for _, g := range f.sheets {
+		ordered = append(ordered, g)
+	}
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i].index < ordered[j].index })
+
+	pos := -1
+	for i, g := range ordered {
+		if g.id == sheetID {
+			pos = i
+			break
+		}
+	}
+	if pos < 0 {
+		return
+	}
+
+	target := ordered[pos]
+	ordered = append(ordered[:pos], ordered[pos+1:]...)
+
+	newIndex = max(newIndex, 0)
+	newIndex = min(newIndex, int64(len(ordered)))
+	ordered = append(ordered, nil)
+	copy(ordered[newIndex+1:], ordered[newIndex:])
+	ordered[newIndex] = target
+
+	for i, g := range ordered {
+		g.index = int64(i)
+	}
+}
+
+// titlesInOrder は現在のタブ順をタイトルの並びで返す。
+func (f *fakeSheetsAPI) titlesInOrder() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	type entry struct {
+		title string
+		index int64
+	}
+	entries := make([]entry, 0, len(f.sheets))
+	for title, g := range f.sheets {
+		entries = append(entries, entry{title: title, index: g.index})
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].index < entries[j].index })
+
+	out := make([]string, len(entries))
+	for i, e := range entries {
+		out[i] = e.title
+	}
+	return out
 }
 
 var rangeRe = regexp.MustCompile(`^(.*)!A(\d+)$`)
@@ -606,5 +676,108 @@ func TestWriteTab_EscapesSingleQuoteInTitleForRequestRanges(t *testing.T) {
 				t.Errorf("update path = %q, want to contain %q", c.path, wantRangePrefix)
 			}
 		}
+	}
+}
+
+func TestMoveTabFirst_MovesTabToIndexZero(t *testing.T) {
+	fake := newFakeSheetsAPI([]string{"other", "daily_summary"}, false)
+	sink := newTestSink(t, fake)
+
+	if err := sink.MoveTabFirst(context.Background(), "daily_summary"); err != nil {
+		t.Fatalf("MoveTabFirst: %v", err)
+	}
+
+	want := []string{"daily_summary", "other"}
+	if got := fake.titlesInOrder(); !slices.Equal(got, want) {
+		t.Errorf("tab order = %v, want %v", got, want)
+	}
+}
+
+// 人手で先頭にシートを挿入されてもキャッシュは追従しないため、現在の index を
+// 見て「既に先頭」と判断すると是正が永久に飛ぶ。毎回無条件に送ること。
+func TestMoveTabFirst_SendsRequestEvenWhenAlreadyFirst(t *testing.T) {
+	fake := newFakeSheetsAPI([]string{"daily_summary", "other"}, false)
+	sink := newTestSink(t, fake)
+
+	for i := range 2 {
+		if err := sink.MoveTabFirst(context.Background(), "daily_summary"); err != nil {
+			t.Fatalf("MoveTabFirst #%d: %v", i+1, err)
+		}
+	}
+
+	if n := fake.countMatching(isBatchUpdate); n != 2 {
+		t.Errorf("batchUpdate calls = %d, want 2", n)
+	}
+}
+
+// Index は omitempty のため、ForceSendFields を怠ると 0 が JSON から消える。
+func TestMoveTabFirst_SendsExplicitZeroIndex(t *testing.T) {
+	fake := newFakeSheetsAPI([]string{"other", "daily_summary"}, false)
+	sink := newTestSink(t, fake)
+
+	if err := sink.MoveTabFirst(context.Background(), "daily_summary"); err != nil {
+		t.Fatalf("MoveTabFirst: %v", err)
+	}
+
+	var body []byte
+	for _, c := range fake.callsSnapshot() {
+		if isBatchUpdate(c) {
+			body = c.body
+		}
+	}
+	if body == nil {
+		t.Fatal("batchUpdate request not sent")
+	}
+
+	var req batchUpdateRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		t.Fatalf("unmarshal request: %v", err)
+	}
+	if len(req.Requests) != 1 || req.Requests[0].UpdateSheetProperties == nil {
+		t.Fatalf("unexpected request body: %s", body)
+	}
+
+	usp := req.Requests[0].UpdateSheetProperties
+	if usp.Properties.Index == nil {
+		t.Fatalf("index omitted from request body: %s", body)
+	}
+	if *usp.Properties.Index != 0 {
+		t.Errorf("index = %d, want 0", *usp.Properties.Index)
+	}
+	if usp.Fields != "index" {
+		t.Errorf("fields = %q, want %q", usp.Fields, "index")
+	}
+}
+
+func TestMoveTabFirst_MissingTabIsNoOp(t *testing.T) {
+	fake := newFakeSheetsAPI([]string{"other"}, false)
+	sink := newTestSink(t, fake)
+
+	if err := sink.MoveTabFirst(context.Background(), "daily_summary"); err != nil {
+		t.Fatalf("MoveTabFirst: %v", err)
+	}
+
+	if n := fake.countMatching(isBatchUpdate); n != 0 {
+		t.Errorf("batchUpdate calls = %d, want 0", n)
+	}
+}
+
+func TestMoveTabFirst_DoesNotResizeGrid(t *testing.T) {
+	fake := newFakeSheetsAPIWithGrids(map[string]fakeSheet{
+		"daily_summary": {rows: 4000, cols: 30, index: 1},
+		"other":         {rows: 1000, cols: 26, index: 0},
+	}, false)
+	sink := newTestSink(t, fake)
+
+	if err := sink.MoveTabFirst(context.Background(), "daily_summary"); err != nil {
+		t.Fatalf("MoveTabFirst: %v", err)
+	}
+
+	grid, ok := fake.gridOf("daily_summary")
+	if !ok {
+		t.Fatal("daily_summary missing")
+	}
+	if grid.rows != 4000 || grid.cols != 30 {
+		t.Errorf("grid = %dx%d, want 4000x30", grid.rows, grid.cols)
 	}
 }

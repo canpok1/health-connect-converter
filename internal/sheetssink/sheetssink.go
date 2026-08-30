@@ -220,6 +220,49 @@ func (s *Sink) growIfNeeded(ctx context.Context, title string, meta *sheetMeta, 
 	return nil
 }
 
+// MoveTabFirst は title のタブを先頭（index 0）へ移動する。
+// Drive の text/csv エクスポートは先頭タブだけを返すため、Claude に読ませたい
+// タブを先頭に固定する目的で使う（ADR 0007）。
+//
+// 現在の index は見ずに毎回無条件で送る。Sink は起動時に読んだタブ情報を
+// プロセスが終わるまでキャッシュし続けるので、人手でシートが先頭へ挿入されても
+// それを知る術がない。「既に先頭なら何もしない」と判断すると是正が永久に飛ぶ。
+// 同じ index を指定しても成功する冪等な操作なので、毎回送って構わない。
+//
+// title のタブが無い場合は何もせず nil を返す（初回の書き込み前は正常）。
+func (s *Sink) MoveTabFirst(ctx context.Context, title string) error {
+	if err := s.ensureLoaded(ctx); err != nil {
+		return err
+	}
+
+	meta, ok := s.sheets[title]
+	if !ok {
+		return nil
+	}
+
+	req := &sheets.BatchUpdateSpreadsheetRequest{
+		Requests: []*sheets.Request{
+			{
+				UpdateSheetProperties: &sheets.UpdateSheetPropertiesRequest{
+					Properties: &sheets.SheetProperties{
+						SheetId: meta.id,
+						Index:   0,
+						// SheetId・Index とも `omitempty` のため、0 をそのまま渡すと
+						// JSON から消える。移動先は常に0なので明示送信が必須。
+						ForceSendFields: []string{"SheetId", "Index"},
+					},
+					Fields: "index",
+				},
+			},
+		},
+	}
+	if _, err := s.svc.Spreadsheets.BatchUpdate(s.spreadsheetID, req).Context(ctx).Do(); err != nil {
+		return fmt.Errorf("sheetssink: move tab %q to first: %w", title, err)
+	}
+
+	return nil
+}
+
 // quoteSheetTitle はタブ名をA1形式レンジ内で使える形にする。
 // タブ名に含まれるシングルクォートは2つに重ねてエスケープする。
 func quoteSheetTitle(title string) string {
