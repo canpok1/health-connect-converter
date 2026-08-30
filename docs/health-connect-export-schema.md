@@ -89,10 +89,10 @@ device_data_provider_id
 | 歩数 | `count` | 歩 | 14 | 歩 | 1 |
 | 距離 | `distance` | メートル | 1.26 | m | 1 |
 | 消費エネルギー | `energy` | **カロリー** | 749366.5 | kcal | 0.001 |
-| 基礎代謝 | `basal_metabolic_rate` | **ワット** | 70.5 | — | 要換算 |
+| 基礎代謝 | `basal_metabolic_rate` | **ワット** | 70.5 | kcal/日 | 20.65 |
 | 心拍 | `beats_per_minute` | bpm | 76 | bpm | 1 |
 
-`basal_metabolic_rate` はワット（Power）で保持されており、kcal/日 へは約 20.6 倍が要る。単純な倍率で扱えるが意味が分かりにくいため、初期の対象種別には含めない。
+`basal_metabolic_rate` はワット（Power）で保持されており、kcal/日 へは 86400（1日の秒数）÷ 4184（1kcalのジュール数）≈ 20.65 倍が要る。単純な倍率で扱え意味も明確なため、対象種別に含める（値名は `kcal_per_day` として単位を明示する）。
 
 ## spec.md との差分
 
