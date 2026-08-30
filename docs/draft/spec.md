@@ -175,6 +175,7 @@ services:
 - ホスト側パスは `./data`（git clone先の直下）。mini-pc の Docker は snap 版で AppArmor により `$HOME` 配下以外へのbind mountができないため、`/srv/...` のような絶対パスは使えない（経緯は [ADR 0003](../adr/0003-relative-data-volume-path.md)）
 - SA 鍵は環境変数ではなく **read-only マウント**。環境変数はログや `docker inspect` に露出する
 - Drive フォルダID・スプレッドシートIDはホスト側の `.env`（gitignore対象、コミットするのは `.env.example`）で渡す。未設定だと `docker compose` が起動前にエラーになる（経緯は [ADR 0005](../adr/0005-deployment-identifiers-via-env-file.md)）
+- コンテナは `plant-diary` と同じ UID/GID（`1000:1000`）で実行する（`Dockerfile` の `USER` 固定）。bind mount した `./data` の書き込み権限を mini-pc の実行ユーザーに合わせるため（経緯は [ADR 0006](../adr/0006-fix-container-uid-to-1000.md)）
 - 手動実行は `docker compose run --rm health-connect-converter --once`。初回のスキーマ調査とバックフィルにも使う
 
 **エラー時の挙動**：常駐ループはエラーで終了しない。ログに出して state を更新せず、次の周回でリトライする。プロセスを落とすと `restart: unless-stopped` が再起動ループを作り、かえって気づきにくくなる。

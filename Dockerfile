@@ -11,5 +11,7 @@ FROM gcr.io/distroless/static-debian12
 WORKDIR /app
 COPY --from=builder /app/health-connect-converter .
 COPY config.yaml .
-USER nonroot:nonroot
+# UID/GIDはplant-diaryのappuserに合わせて固定（mini-pcの実行ユーザーと一致させ、
+# bind mountしたdataディレクトリの書き込み権限を揃えるため。経緯はADR 0006）
+USER 1000:1000
 ENTRYPOINT ["/app/health-connect-converter"]
