@@ -45,6 +45,7 @@ type Store interface {
 // Sink はスプレッドシートへの書き込み先。internal/sheetssink が満たす。
 type Sink interface {
 	WriteTab(ctx context.Context, title string, rows [][]any) error
+	MoveTabFirst(ctx context.Context, title string) error
 }
 
 // App は1周ぶんの処理とポーリングループを持つ。
@@ -74,7 +75,8 @@ func New(cfg *config.Config, src Source, rd Reader, st Store, sink Sink, logger 
 	}
 }
 
-// RunOnce は1周ぶんの処理をする。新着が無ければ何もせず nil を返す。
+// RunOnce は1周ぶんの処理をする。新着が無ければ取り込みは行わず、
+// daily_summary を先頭タブへ戻す是正だけを行う。
 func (a *App) RunOnce(ctx context.Context) error {
 	started := time.Now()
 
@@ -89,7 +91,7 @@ func (a *App) RunOnce(ctx context.Context) error {
 	}
 	if zip == nil {
 		a.logger.Info("新着なし", "after", after)
-		return nil
+		return a.ensureDailySummaryFirst(ctx)
 	}
 	a.logger.Info("ZIP取得",
 		"file_id", zip.FileID,
@@ -124,6 +126,11 @@ func (a *App) RunOnce(ctx context.Context) error {
 
 	lastSuccess := a.now()
 	if err := a.writeMeta(ctx, lastSuccess, zip.ModifiedTime); err != nil {
+		return err
+	}
+
+	// writeDailySummary がタブを作った後に呼ぶ。初回実行ではこの位置でしか移動できない。
+	if err := a.ensureDailySummaryFirst(ctx); err != nil {
 		return err
 	}
 
@@ -174,6 +181,18 @@ func (a *App) writeRawTabs(ctx context.Context) error {
 			return fmt.Errorf("app: write tab %q: %w", title, err)
 		}
 		a.logger.Info("タブ書き込み", "tab", title, "rows", len(rows))
+	}
+	return nil
+}
+
+// ensureDailySummaryFirst は daily_summary を先頭タブへ戻す。
+//
+// Drive の text/csv エクスポートは先頭タブだけを返すため、Claude が読むのは
+// 実質この1タブになる（ADR 0007）。人手でシートが先頭へ挿入されると読み先が
+// すり替わるので、新着ZIPの有無によらず毎周回で呼ぶ。
+func (a *App) ensureDailySummaryFirst(ctx context.Context) error {
+	if err := a.sink.MoveTabFirst(ctx, report.DailySummaryTitle); err != nil {
+		return fmt.Errorf("app: move tab %q to first: %w", report.DailySummaryTitle, err)
 	}
 	return nil
 }
