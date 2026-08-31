@@ -53,4 +53,6 @@ docker compose run --rm health-connect-converter --once
 docker compose logs -f
 ```
 
+mini-pc上ではWatchtowerが5分間隔でこのイメージの更新を自動検知し、コンテナを再作成する。導入経緯は [canpok1/mini-pc-setup](https://github.com/canpok1/mini-pc-setup) の ADR 0001 を参照。
+
 詳細な運用方針は [docs/draft/spec.md](docs/draft/spec.md#配備docker-compose) を参照。
