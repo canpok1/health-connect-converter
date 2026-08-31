@@ -116,9 +116,7 @@ types:
   exercise_session:
     source_table: exercise_session_record_table
     time_layout: interval
-    columns:
-      rpe:
-        column: session_rate_of_perceived_exertion
+    columns: {}
     include_duration: true
     window: all
     daily: [sum, count]
