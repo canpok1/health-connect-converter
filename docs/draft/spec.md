@@ -135,6 +135,8 @@ UPSERT は `INSERT ... ON CONFLICT(uuid) DO UPDATE`。トランザクション�
 
 種別の追加はエントリ1つ。コード変更は不要。
 
+**列を追加する前に、エクスポート DB で実データの分布（distinct 値・件数・値域）を確認する。** `config.yaml` は書いた列をそのまま出力へ流す設計（[ADR 0004](../adr/0004-config-driven-generic-records.md)）で、エクスポート元の値が壊れていても検証しないため、壊れた列をそのまま追加してしまう（`session_rate_of_perceived_exertion` の異常値がその実例。distinct = 1 を見た時点で気付けた）。
+
 ```yaml
 types:
   blood_pressure:
