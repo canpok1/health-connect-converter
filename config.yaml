@@ -7,6 +7,7 @@ types:
         column: systolic
       diastolic:
         column: diastolic
+    category: vitals
     window: all
     daily: [mean, min, max, count]
 
@@ -17,6 +18,7 @@ types:
     columns:
       bpm:
         column: beats_per_minute
+    category: vitals
     window: all
     daily: [mean, min, max, count]
 
@@ -25,6 +27,9 @@ types:
     time_layout: interval
     columns: {}
     include_duration: true
+    category: sleep
+    dedupe: true
+    date_basis: end
     window: all
     daily: [sum, count]
 
@@ -34,6 +39,8 @@ types:
     columns:
       count:
         column: count
+    category: activity
+    dedupe: true
     window: 30d
     daily: [sum]
 
@@ -44,6 +51,7 @@ types:
       kg:
         column: weight
         scale: 0.001
+    category: body_measurements
     window: all
     daily: [mean, min, max, count]
 
@@ -53,6 +61,7 @@ types:
     columns:
       percent:
         column: percentage
+    category: body_measurements
     window: all
     daily: [mean, min, max, count]
 
@@ -63,6 +72,7 @@ types:
       kcal_per_day:
         column: basal_metabolic_rate
         scale: 20.65
+    category: body_measurements
     window: all
     daily: [mean, count]
 
@@ -73,6 +83,7 @@ types:
       cm:
         column: height
         scale: 100
+    category: body_measurements
     window: all
     daily: [mean, count]
 
@@ -82,6 +93,7 @@ types:
     columns:
       bpm:
         column: beats_per_minute
+    category: vitals
     window: all
     daily: [mean, min, max, count]
 
@@ -91,6 +103,7 @@ types:
     columns:
       percent:
         column: percentage
+    category: vitals
     window: all
     daily: [mean, min, max, count]
 
@@ -100,6 +113,8 @@ types:
     columns:
       m:
         column: distance
+    category: activity
+    dedupe: true
     window: 30d
     daily: [sum]
 
@@ -110,6 +125,8 @@ types:
       kcal:
         column: energy
         scale: 0.001
+    category: activity
+    dedupe: true
     window: all
     daily: [sum]
 
@@ -118,6 +135,8 @@ types:
     time_layout: interval
     columns: {}
     include_duration: true
+    category: activity
+    dedupe: true
     window: all
     daily: [sum, count]
 
@@ -128,5 +147,6 @@ types:
     columns:
       m_per_s:
         column: speed
+    category: activity
     window: 30d
     daily: [mean, max, count]

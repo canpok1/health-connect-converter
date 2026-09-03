@@ -32,16 +32,17 @@ func (f *fakeSource) FetchLatest(_ context.Context, after time.Time) (*model.Zip
 
 type fakeReader struct {
 	recs  map[string][]model.Record
+	prios model.AppPriorities
 	err   error
 	calls int
 }
 
-func (f *fakeReader) Read(_ *model.ZipFile, _ *config.Config) (map[string][]model.Record, error) {
+func (f *fakeReader) Read(_ *model.ZipFile, _ *config.Config) (*model.ExportData, error) {
 	f.calls++
 	if f.err != nil {
 		return nil, f.err
 	}
-	return f.recs, nil
+	return &model.ExportData{Records: f.recs, Priorities: f.prios}, nil
 }
 
 type upsertCall struct {
@@ -57,6 +58,9 @@ type fakeStore struct {
 	upsertErr   error
 	upsertCalls []upsertCall
 
+	prios            model.AppPriorities
+	setPrioritiesErr error
+
 	dailyErr   error
 	recordsErr error
 	statsErr   error
@@ -69,7 +73,12 @@ func newFakeStore() *fakeStore {
 	return &fakeStore{state: map[string]string{}}
 }
 
-func (f *fakeStore) UpsertRecords(_ context.Context, typeKey string, _ config.TypeConfig, recs []model.Record) (int, error) {
+func (f *fakeStore) SetAppPriorities(_ context.Context, prios model.AppPriorities) error {
+	f.prios = prios
+	return f.setPrioritiesErr
+}
+
+func (f *fakeStore) ReplaceRecords(_ context.Context, typeKey string, _ config.TypeConfig, recs []model.Record) (int, error) {
 	f.upsertCalls = append(f.upsertCalls, upsertCall{typeKey: typeKey, recs: recs})
 	if f.upsertErr != nil {
 		return 0, f.upsertErr

@@ -312,3 +312,80 @@ func TestConfig_TypeKeys(t *testing.T) {
 		}
 	}
 }
+
+func TestLoad_CategoryAndDedupe(t *testing.T) {
+	base := `
+types:
+  steps:
+    source_table: steps_record_table
+    time_layout: interval
+    columns:
+      count:
+        column: count
+    window: all
+    daily: [sum]
+`
+	tests := []struct {
+		name    string
+		extra   string
+		wantErr bool
+	}{
+		{name: "カテゴリ省略", extra: "", wantErr: false},
+		{name: "既知のカテゴリ", extra: "    category: activity\n", wantErr: false},
+		{name: "未知のカテゴリ", extra: "    category: workouts\n", wantErr: true},
+		{name: "dedupeにカテゴリあり", extra: "    category: activity\n    dedupe: true\n", wantErr: false},
+		{name: "dedupeにカテゴリなし", extra: "    dedupe: true\n", wantErr: true},
+		{name: "date_basis end", extra: "    date_basis: end\n", wantErr: false},
+		{name: "不正なdate_basis", extra: "    date_basis: middle\n", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := Load(writeConfig(t, base+tt.extra))
+			if tt.wantErr && err == nil {
+				t.Fatal("expected error, got nil")
+			}
+			if !tt.wantErr && err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+// 瞬時値は開始と終了が同じで、end を指定しても意味が無い。設定ミスを通さない。
+func TestLoad_DateBasisEndRejectedForInstant(t *testing.T) {
+	_, err := Load(writeConfig(t, `
+types:
+  weight:
+    source_table: weight_record_table
+    time_layout: instant
+    columns:
+      kg:
+        column: weight
+    window: all
+    date_basis: end
+    daily: [mean]
+`))
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+}
+
+func TestLoad_DateBasisDefaultsToStart(t *testing.T) {
+	cfg, err := Load(writeConfig(t, `
+types:
+  steps:
+    source_table: steps_record_table
+    time_layout: interval
+    columns:
+      count:
+        column: count
+    window: all
+    daily: [sum]
+`))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := cfg.Types["steps"].DateBasis; got != DateBasisStart {
+		t.Errorf("DateBasis = %q, want %q", got, DateBasisStart)
+	}
+}

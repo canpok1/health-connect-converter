@@ -27,6 +27,30 @@ var dailyFuncs = map[string]bool{
 	"count": true,
 }
 
+// 日次集約で1日を決める基準。
+const (
+	DateBasisStart = "start"
+	DateBasisEnd   = "end"
+)
+
+var dateBases = map[string]bool{
+	DateBasisStart: true,
+	DateBasisEnd:   true,
+}
+
+// Categories は Health Connect のデータカテゴリ名と、エクスポートDBの
+// health_data_category_priority_table.health_data_category が持つ整数の対応。
+// 整数は Android の HealthDataCategory の定数値。
+var Categories = map[string]int{
+	"activity":          1,
+	"body_measurements": 2,
+	"cycle_tracking":    3,
+	"nutrition":         4,
+	"sleep":             5,
+	"vitals":            6,
+	"wellness":          7,
+}
+
 var identifierRe = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
 
 const durationValueName = "duration_min"
@@ -46,6 +70,15 @@ type TypeConfig struct {
 	Window          string                  `yaml:"window"`
 	Daily           []string                `yaml:"daily"`
 	IncludeDuration bool                    `yaml:"include_duration"`
+	// Category は Health Connect のデータカテゴリ名（Categories のキー）。
+	// アプリの優先度はカテゴリ単位で設定されるため、Dedupe を使うなら必須。
+	Category string `yaml:"category"`
+	// Dedupe が真なら、日次集約の前に「同じ時間帯を複数アプリが書いている」
+	// レコードを Health Connect のアプリ優先度で1つへ絞る。
+	Dedupe bool `yaml:"dedupe"`
+	// DateBasis は日次集約でレコードをどの日に数えるか。既定は "start"。
+	// 日をまたぐ睡眠を起床日へ寄せる場合に "end" を指定する。
+	DateBasis string `yaml:"date_basis"`
 }
 
 // Config は設定ファイル全体。
@@ -75,6 +108,9 @@ func Load(path string) (*Config, error) {
 				col.Scale = 1
 				tc.Columns[name] = col
 			}
+		}
+		if tc.DateBasis == "" {
+			tc.DateBasis = DateBasisStart
 		}
 		cfg.Types[key] = tc
 	}
@@ -140,6 +176,21 @@ func (tc TypeConfig) validate(key string) error {
 		return fmt.Errorf("config: type %q: %w", key, err)
 	}
 
+	if tc.Category != "" {
+		if _, ok := Categories[tc.Category]; !ok {
+			return fmt.Errorf("config: type %q: unknown category %q", key, tc.Category)
+		}
+	}
+	if tc.Dedupe && tc.Category == "" {
+		return fmt.Errorf("config: type %q: category is required when dedupe is true", key)
+	}
+	if tc.DateBasis != "" && !dateBases[tc.DateBasis] {
+		return fmt.Errorf("config: type %q: invalid date_basis %q (must be %s or %s)", key, tc.DateBasis, DateBasisStart, DateBasisEnd)
+	}
+	if tc.DateBasis == DateBasisEnd && tc.TimeLayout == LayoutInstant {
+		return fmt.Errorf("config: type %q: date_basis %q is meaningless for time_layout %q", key, DateBasisEnd, LayoutInstant)
+	}
+
 	if len(tc.Daily) == 0 {
 		return fmt.Errorf("config: type %q: daily must not be empty", key)
 	}
@@ -197,4 +248,10 @@ func (t TypeConfig) WindowDuration() (time.Duration, bool, error) {
 		return 0, false, fmt.Errorf("invalid window %q: %w", t.Window, err)
 	}
 	return time.Duration(n) * 24 * time.Hour, false, nil
+}
+
+// CategoryID は Category に対応する整数を返す。未設定・未知なら false。
+func (t TypeConfig) CategoryID() (int, bool) {
+	id, ok := Categories[t.Category]
+	return id, ok
 }

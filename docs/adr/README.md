@@ -11,3 +11,5 @@
 | [0005](0005-deployment-identifiers-via-env-file.md) | デプロイ固有の識別子は.envの環境変数で渡す | 採用 | 2026-08-29 |
 | [0006](0006-fix-container-uid-to-1000.md) | コンテナの実行UID/GIDをplant-diaryに合わせて固定する | 採用 | 2026-08-30 |
 | [0007](0007-daily-summary-as-first-tab.md) | Claudeに読ませる正本としてdaily_summaryを先頭タブに固定する | 採用 | 2026-08-30 |
+| [0008](0008-replace-cumulative-records-per-day.md) | エクスポートに含まれる日は累積DBを日ごと置き換える | 採用 | 2026-09-03 |
+| [0009](0009-dedupe-by-health-connect-app-priority.md) | 日次集約をGo側で行い、アプリ優先度で重複排除する | 採用 | 2026-09-03 |

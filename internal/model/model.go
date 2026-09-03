@@ -21,6 +21,16 @@ type ZipFile struct {
 	Data         []byte
 }
 
+// AppPriorities はデータカテゴリごとのアプリ優先順。スライスの先頭が最優先。
+// キーは Health Connect のカテゴリ整数（config.Categories の値）。
+type AppPriorities map[int][]string
+
+// ExportData はエクスポートDBから読み出した内容一式。
+type ExportData struct {
+	Records    map[string][]Record
+	Priorities AppPriorities
+}
+
 // DailyRow は1日ぶんの集約結果。
 type DailyRow struct {
 	Date   string // 現地日 "2006-01-02"
