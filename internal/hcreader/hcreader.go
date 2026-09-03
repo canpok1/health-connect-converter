@@ -38,7 +38,7 @@ type Reader struct {
 }
 
 // Read は zip を TempDir 配下に展開してから読み、一時ファイルを必ず削除する。
-func (r *Reader) Read(zipFile *model.ZipFile, cfg *config.Config) (map[string][]model.Record, error) {
+func (r *Reader) Read(zipFile *model.ZipFile, cfg *config.Config) (*model.ExportData, error) {
 	if err := os.MkdirAll(r.TempDir, 0o755); err != nil {
 		return nil, fmt.Errorf("hcreader: mkdir %s: %w", r.TempDir, err)
 	}
@@ -104,22 +104,112 @@ func ExtractDB(zipData []byte, destPath string) error {
 }
 
 // ReadDB は展開済みのエクスポートDBを cfg の種別定義に従って読む。
-func ReadDB(dbPath string, cfg *config.Config) (map[string][]model.Record, error) {
+func ReadDB(dbPath string, cfg *config.Config) (*model.ExportData, error) {
 	db, err := sql.Open("sqlite", fmt.Sprintf("file:%s?mode=ro", dbPath))
 	if err != nil {
 		return nil, fmt.Errorf("hcreader: open %s: %w", dbPath, err)
 	}
 	defer func() { _ = db.Close() }()
 
-	result := make(map[string][]model.Record, len(cfg.Types))
+	records := make(map[string][]model.Record, len(cfg.Types))
 	for _, key := range cfg.TypeKeys() {
 		recs, err := readType(db, cfg.Types[key])
 		if err != nil {
 			return nil, fmt.Errorf("hcreader: type %q: %w", key, err)
 		}
-		result[key] = recs
+		records[key] = recs
 	}
-	return result, nil
+
+	prios, err := readAppPriorities(db)
+	if err != nil {
+		return nil, err
+	}
+
+	return &model.ExportData{Records: records, Priorities: prios}, nil
+}
+
+const priorityTable = "health_data_category_priority_table"
+
+// readAppPriorities は Health Connect の「アプリの優先度」設定を読む。
+// app_id_priority_order は application_info_table.row_id をカンマで並べた
+// 文字列で、先頭が最優先。テーブルが無いエクスポートもありうるため、
+// 存在しなければ空を返す（優先度が無くても取り込みは続けられる）。
+func readAppPriorities(db *sql.DB) (model.AppPriorities, error) {
+	var exists int
+	err := db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?", priorityTable).Scan(&exists)
+	if err != nil {
+		return nil, fmt.Errorf("hcreader: look up %s: %w", priorityTable, err)
+	}
+	if exists == 0 {
+		return model.AppPriorities{}, nil
+	}
+
+	apps, err := readAppNames(db)
+	if err != nil {
+		return nil, err
+	}
+
+	rows, err := db.Query("SELECT health_data_category, app_id_priority_order FROM " + priorityTable)
+	if err != nil {
+		return nil, fmt.Errorf("hcreader: query %s: %w", priorityTable, err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	prios := make(model.AppPriorities)
+	for rows.Next() {
+		var category int
+		var order sql.NullString
+		if err := rows.Scan(&category, &order); err != nil {
+			return nil, fmt.Errorf("hcreader: scan %s: %w", priorityTable, err)
+		}
+		var names []string
+		for _, field := range strings.Split(order.String, ",") {
+			field = strings.TrimSpace(field)
+			if field == "" {
+				continue
+			}
+			id, err := strconv.ParseInt(field, 10, 64)
+			if err != nil {
+				return nil, fmt.Errorf("hcreader: %s: invalid app_id_priority_order %q: %w", priorityTable, order.String, err)
+			}
+			// 対応するアプリが application_info_table から消えていることがある。
+			// 順序だけ残っても使えないため飛ばす。
+			if name, ok := apps[id]; ok {
+				names = append(names, name)
+			}
+		}
+		if len(names) > 0 {
+			prios[category] = names
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("hcreader: query %s: %w", priorityTable, err)
+	}
+	return prios, nil
+}
+
+func readAppNames(db *sql.DB) (map[int64]string, error) {
+	rows, err := db.Query("SELECT row_id, package_name FROM application_info_table")
+	if err != nil {
+		return nil, fmt.Errorf("hcreader: query application_info_table: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	apps := make(map[int64]string)
+	for rows.Next() {
+		var id int64
+		var name sql.NullString
+		if err := rows.Scan(&id, &name); err != nil {
+			return nil, fmt.Errorf("hcreader: scan application_info_table: %w", err)
+		}
+		if name.Valid && name.String != "" {
+			apps[id] = name.String
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("hcreader: query application_info_table: %w", err)
+	}
+	return apps, nil
 }
 
 func readType(db *sql.DB, tc config.TypeConfig) ([]model.Record, error) {

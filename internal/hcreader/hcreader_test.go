@@ -165,7 +165,7 @@ func TestReadDB_Instant(t *testing.T) {
 		t.Fatalf("ReadDB: %v", err)
 	}
 
-	recs := got["instant_type"]
+	recs := got.Records["instant_type"]
 	if len(recs) != 2 {
 		t.Fatalf("expected 2 records, got %d", len(recs))
 	}
@@ -212,7 +212,7 @@ func TestReadDB_Instant_UUIDIsLowerHex32(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadDB: %v", err)
 	}
-	for _, r := range got["instant_type"] {
+	for _, r := range got.Records["instant_type"] {
 		if len(r.UUID) != 32 {
 			t.Errorf("uuid length = %d, want 32 (uuid=%q)", len(r.UUID), r.UUID)
 		}
@@ -235,7 +235,7 @@ func TestReadDB_Interval(t *testing.T) {
 		t.Fatalf("ReadDB: %v", err)
 	}
 
-	recs := got["interval_type"]
+	recs := got.Records["interval_type"]
 	if len(recs) != 1 {
 		t.Fatalf("expected 1 record, got %d", len(recs))
 	}
@@ -265,7 +265,7 @@ func TestReadDB_Series(t *testing.T) {
 		t.Fatalf("ReadDB: %v", err)
 	}
 
-	recs := got["series_type"]
+	recs := got.Records["series_type"]
 	if len(recs) != 3 {
 		t.Fatalf("expected 3 records, got %d", len(recs))
 	}
@@ -320,7 +320,7 @@ func TestReadDB_MissingSourceTable_ReturnsEmptySliceNoError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadDB: %v", err)
 	}
-	recs, ok := got["missing_type"]
+	recs, ok := got.Records["missing_type"]
 	if !ok {
 		t.Fatalf("expected key %q to be present", "missing_type")
 	}
@@ -339,7 +339,7 @@ func TestReadDB_MissingSeriesTable_ReturnsEmptySliceNoError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadDB: %v", err)
 	}
-	recs, ok := got["missing_series"]
+	recs, ok := got.Records["missing_series"]
 	if !ok {
 		t.Fatalf("expected key %q to be present", "missing_series")
 	}
@@ -358,9 +358,9 @@ func TestReadDB_Series_CamelCaseSourceTable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadDB: %v", err)
 	}
-	recs, ok := got["camel_series_type"]
+	recs, ok := got.Records["camel_series_type"]
 	if !ok || len(recs) != 1 {
-		t.Fatalf("expected 1 record for camel_series_type, got %+v", got["camel_series_type"])
+		t.Fatalf("expected 1 record for camel_series_type, got %+v", got.Records["camel_series_type"])
 	}
 	if recs[0].Values["speed"] != 1.5 {
 		t.Errorf("speed = %v, want 1.5", recs[0].Values["speed"])
@@ -482,8 +482,8 @@ func TestReader_Read_CleansUpTempFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Read: %v", err)
 	}
-	if len(got["instant_type"]) != 2 {
-		t.Fatalf("expected 2 records, got %d", len(got["instant_type"]))
+	if len(got.Records["instant_type"]) != 2 {
+		t.Fatalf("expected 2 records, got %d", len(got.Records["instant_type"]))
 	}
 
 	entries, err := os.ReadDir(tempDir)
@@ -512,5 +512,85 @@ func TestReader_Read_CleansUpTempFileOnError(t *testing.T) {
 	}
 	if len(entries) != 0 {
 		t.Errorf("expected TempDir to be empty after failed Read, found %v", entries)
+	}
+}
+
+// newPriorityDB は優先度テーブルを持つエクスポートDB相当のファイルを作る。
+// hasPriorityTable が偽なら、優先度テーブルの無い（古い/別実装の）エクスポートを再現する。
+func newPriorityDB(t *testing.T, hasPriorityTable bool) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "priority.db")
+
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	exec := func(query string, args ...any) {
+		t.Helper()
+		if _, err := db.Exec(query, args...); err != nil {
+			t.Fatalf("exec %q: %v", query, err)
+		}
+	}
+
+	exec(`CREATE TABLE application_info_table (row_id INTEGER PRIMARY KEY, package_name TEXT)`)
+	exec(`INSERT INTO application_info_table (row_id, package_name) VALUES (1, 'com.example.fit'), (9, 'com.example.band')`)
+	exec(`CREATE TABLE hc_instant (
+		uuid BLOB, time INTEGER, zone_offset INTEGER, app_info_id INTEGER, value_a REAL
+	)`)
+
+	if hasPriorityTable {
+		exec(`CREATE TABLE health_data_category_priority_table (
+			row_id INTEGER PRIMARY KEY, health_data_category INTEGER, app_id_priority_order TEXT
+		)`)
+		// 4 は application_info_table に無いアプリ。順序だけ残っていても使えない。
+		exec(`INSERT INTO health_data_category_priority_table (health_data_category, app_id_priority_order)
+			VALUES (1, '4,9,1'), (5, '1')`)
+	}
+
+	return path
+}
+
+func priorityTestConfig() *config.Config {
+	return &config.Config{Types: map[string]config.TypeConfig{
+		"instant_type": {
+			SourceTable: "hc_instant",
+			TimeLayout:  config.LayoutInstant,
+			Columns:     map[string]config.ColumnConfig{"a": {Column: "value_a", Scale: 1}},
+			Window:      "all",
+			Daily:       []string{"mean"},
+		},
+	}}
+}
+
+func TestReadDBReadsAppPriorities(t *testing.T) {
+	got, err := ReadDB(newPriorityDB(t, true), priorityTestConfig())
+	if err != nil {
+		t.Fatalf("ReadDB: %v", err)
+	}
+
+	activity := got.Priorities[1]
+	want := []string{"com.example.band", "com.example.fit"}
+	if len(activity) != len(want) {
+		t.Fatalf("priorities[1] = %v, want %v", activity, want)
+	}
+	for i := range want {
+		if activity[i] != want[i] {
+			t.Fatalf("priorities[1] = %v, want %v", activity, want)
+		}
+	}
+	if len(got.Priorities[5]) != 1 || got.Priorities[5][0] != "com.example.fit" {
+		t.Errorf("priorities[5] = %v, want [com.example.fit]", got.Priorities[5])
+	}
+}
+
+func TestReadDBWithoutPriorityTable(t *testing.T) {
+	got, err := ReadDB(newPriorityDB(t, false), priorityTestConfig())
+	if err != nil {
+		t.Fatalf("ReadDB: %v", err)
+	}
+	if len(got.Priorities) != 0 {
+		t.Errorf("priorities = %v, want empty", got.Priorities)
 	}
 }

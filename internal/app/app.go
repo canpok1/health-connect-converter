@@ -28,13 +28,14 @@ type Source interface {
 
 // Reader はZIPから種別ごとのレコードを読み出す。internal/hcreader が満たす。
 type Reader interface {
-	Read(zip *model.ZipFile, cfg *config.Config) (map[string][]model.Record, error)
+	Read(zip *model.ZipFile, cfg *config.Config) (*model.ExportData, error)
 }
 
 // Store は累積DBと state の永続化。internal/store が満たす。
 // report.Querier のメソッドを含むため、そのまま report.Querier として渡せる。
 type Store interface {
-	UpsertRecords(ctx context.Context, typeKey string, tc config.TypeConfig, recs []model.Record) (int, error)
+	ReplaceRecords(ctx context.Context, typeKey string, tc config.TypeConfig, recs []model.Record) (int, error)
+	SetAppPriorities(ctx context.Context, prios model.AppPriorities) error
 	DailyAggregates(ctx context.Context, typeKey string, tc config.TypeConfig) ([]model.DailyRow, error)
 	RecordsSince(ctx context.Context, typeKey string, tc config.TypeConfig, sinceMs int64) ([]model.Record, error)
 	TypeStats(ctx context.Context, typeKey string) (model.TypeStats, error)
@@ -100,21 +101,26 @@ func (a *App) RunOnce(ctx context.Context) error {
 		"size", len(zip.Data),
 	)
 
-	recsByType, err := a.rd.Read(zip, a.cfg)
+	data, err := a.rd.Read(zip, a.cfg)
 	if err != nil {
 		return fmt.Errorf("app: read zip: %w", err)
 	}
 
+	if err := a.st.SetAppPriorities(ctx, data.Priorities); err != nil {
+		return fmt.Errorf("app: save app priorities: %w", err)
+	}
+	a.logger.Info("アプリ優先度を取得", "categories", len(data.Priorities))
+
 	for _, tk := range a.cfg.TypeKeys() {
-		recs, ok := recsByType[tk]
+		recs, ok := data.Records[tk]
 		if !ok {
 			continue
 		}
-		n, err := a.st.UpsertRecords(ctx, tk, a.cfg.Types[tk], recs)
+		n, err := a.st.ReplaceRecords(ctx, tk, a.cfg.Types[tk], recs)
 		if err != nil {
-			return fmt.Errorf("app: upsert records for %q: %w", tk, err)
+			return fmt.Errorf("app: replace records for %q: %w", tk, err)
 		}
-		a.logger.Info("UPSERT完了", "type", tk, "count", n)
+		a.logger.Info("取り込み完了", "type", tk, "count", n)
 	}
 
 	if err := a.writeDailySummary(ctx); err != nil {
