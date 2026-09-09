@@ -31,10 +31,11 @@ func (f *fakeSource) FetchLatest(_ context.Context, after time.Time) (*model.Zip
 }
 
 type fakeReader struct {
-	recs  map[string][]model.Record
-	prios model.AppPriorities
-	err   error
-	calls int
+	recs      map[string][]model.Record
+	prios     model.AppPriorities
+	tableRows map[string]int64
+	err       error
+	calls     int
 }
 
 func (f *fakeReader) Read(_ *model.ZipFile, _ *config.Config) (*model.ExportData, error) {
@@ -42,7 +43,7 @@ func (f *fakeReader) Read(_ *model.ZipFile, _ *config.Config) (*model.ExportData
 	if f.err != nil {
 		return nil, f.err
 	}
-	return &model.ExportData{Records: f.recs, Priorities: f.prios}, nil
+	return &model.ExportData{Records: f.recs, Priorities: f.prios, TableRows: f.tableRows}, nil
 }
 
 type upsertCall struct {
@@ -400,6 +401,38 @@ func TestRunOnce_Success_UpdatesStateAndWritesTabsInOrder(t *testing.T) {
 	}
 	if got[stateKeyLastSuccessAt] != now.Format(time.RFC3339) {
 		t.Errorf("last_success_at = %q, want %q", got[stateKeyLastSuccessAt], now.Format(time.RFC3339))
+	}
+}
+
+func TestRunOnce_MetaIncludesExportTableRows(t *testing.T) {
+	zip := &model.ZipFile{FileID: "file-1", ModifiedTime: time.Now(), Data: []byte("dummy")}
+	src := &fakeSource{zip: zip}
+	rd := &fakeReader{tableRows: map[string]int64{"unregistered_table": 7}}
+	sink := &fakeSink{}
+
+	a := New(testConfig(), src, rd, newFakeStore(), sink, discardLogger(), nil)
+	if err := a.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce() error = %v", err)
+	}
+
+	var meta [][]any
+	for _, c := range sink.calls {
+		if c.title == report.MetaTitle {
+			meta = c.rows
+		}
+	}
+	if meta == nil {
+		t.Fatalf("_meta タブが書かれていない: %+v", sink.calls)
+	}
+
+	found := false
+	for _, row := range meta {
+		if len(row) == 2 && row[0] == "export_unregistered_table_rows" && row[1] == int64(7) {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("_meta に export_unregistered_table_rows が無い: %+v", meta)
 	}
 }
 

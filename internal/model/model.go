@@ -29,6 +29,10 @@ type AppPriorities map[int][]string
 type ExportData struct {
 	Records    map[string][]Record
 	Priorities AppPriorities
+	// TableRows はエクスポートDB内の全テーブルの行数。テーブル名がキー。
+	// config に登録していないテーブルへ書き込みが始まったことに気づけるよう、
+	// 種別定義とは無関係にDB内のテーブルをすべて数える。
+	TableRows map[string]int64
 }
 
 // DailyRow は1日ぶんの集約結果。

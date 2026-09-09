@@ -5,8 +5,11 @@ import (
 	"bytes"
 	"database/sql"
 	"encoding/hex"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 
 	_ "modernc.org/sqlite"
@@ -160,7 +163,7 @@ func TestReadDB_Instant(t *testing.T) {
 	dbPath := newFixtureDB(t)
 	cfg := &config.Config{Types: map[string]config.TypeConfig{"instant_type": instantTypeConfig()}}
 
-	got, err := ReadDB(dbPath, cfg)
+	got, err := ReadDB(dbPath, cfg, nil)
 	if err != nil {
 		t.Fatalf("ReadDB: %v", err)
 	}
@@ -208,7 +211,7 @@ func TestReadDB_Instant_UUIDIsLowerHex32(t *testing.T) {
 	dbPath := newFixtureDB(t)
 	cfg := &config.Config{Types: map[string]config.TypeConfig{"instant_type": instantTypeConfig()}}
 
-	got, err := ReadDB(dbPath, cfg)
+	got, err := ReadDB(dbPath, cfg, nil)
 	if err != nil {
 		t.Fatalf("ReadDB: %v", err)
 	}
@@ -230,7 +233,7 @@ func TestReadDB_Interval(t *testing.T) {
 	dbPath := newFixtureDB(t)
 	cfg := &config.Config{Types: map[string]config.TypeConfig{"interval_type": intervalTypeConfig()}}
 
-	got, err := ReadDB(dbPath, cfg)
+	got, err := ReadDB(dbPath, cfg, nil)
 	if err != nil {
 		t.Fatalf("ReadDB: %v", err)
 	}
@@ -260,7 +263,7 @@ func TestReadDB_Series(t *testing.T) {
 	dbPath := newFixtureDB(t)
 	cfg := &config.Config{Types: map[string]config.TypeConfig{"series_type": seriesTypeConfig()}}
 
-	got, err := ReadDB(dbPath, cfg)
+	got, err := ReadDB(dbPath, cfg, nil)
 	if err != nil {
 		t.Fatalf("ReadDB: %v", err)
 	}
@@ -316,7 +319,7 @@ func TestReadDB_MissingSourceTable_ReturnsEmptySliceNoError(t *testing.T) {
 	tc.SourceTable = "table_does_not_exist"
 	cfg := &config.Config{Types: map[string]config.TypeConfig{"missing_type": tc}}
 
-	got, err := ReadDB(dbPath, cfg)
+	got, err := ReadDB(dbPath, cfg, nil)
 	if err != nil {
 		t.Fatalf("ReadDB: %v", err)
 	}
@@ -335,7 +338,7 @@ func TestReadDB_MissingSeriesTable_ReturnsEmptySliceNoError(t *testing.T) {
 	tc.SeriesTable = "series_table_does_not_exist"
 	cfg := &config.Config{Types: map[string]config.TypeConfig{"missing_series": tc}}
 
-	got, err := ReadDB(dbPath, cfg)
+	got, err := ReadDB(dbPath, cfg, nil)
 	if err != nil {
 		t.Fatalf("ReadDB: %v", err)
 	}
@@ -354,7 +357,7 @@ func TestReadDB_Series_CamelCaseSourceTable(t *testing.T) {
 	dbPath := newFixtureDB(t)
 	cfg := &config.Config{Types: map[string]config.TypeConfig{"camel_series_type": camelSeriesTypeConfig()}}
 
-	got, err := ReadDB(dbPath, cfg)
+	got, err := ReadDB(dbPath, cfg, nil)
 	if err != nil {
 		t.Fatalf("ReadDB: %v", err)
 	}
@@ -373,7 +376,7 @@ func TestReadDB_InvalidSourceTable_Errors(t *testing.T) {
 	tc.SourceTable = "hc_instant; DROP TABLE hc_instant;--"
 	cfg := &config.Config{Types: map[string]config.TypeConfig{"evil": tc}}
 
-	if _, err := ReadDB(dbPath, cfg); err == nil {
+	if _, err := ReadDB(dbPath, cfg, nil); err == nil {
 		t.Fatalf("expected error for invalid source_table, got nil")
 	}
 
@@ -565,7 +568,7 @@ func priorityTestConfig() *config.Config {
 }
 
 func TestReadDBReadsAppPriorities(t *testing.T) {
-	got, err := ReadDB(newPriorityDB(t, true), priorityTestConfig())
+	got, err := ReadDB(newPriorityDB(t, true), priorityTestConfig(), nil)
 	if err != nil {
 		t.Fatalf("ReadDB: %v", err)
 	}
@@ -586,11 +589,142 @@ func TestReadDBReadsAppPriorities(t *testing.T) {
 }
 
 func TestReadDBWithoutPriorityTable(t *testing.T) {
-	got, err := ReadDB(newPriorityDB(t, false), priorityTestConfig())
+	got, err := ReadDB(newPriorityDB(t, false), priorityTestConfig(), nil)
 	if err != nil {
 		t.Fatalf("ReadDB: %v", err)
 	}
 	if len(got.Priorities) != 0 {
 		t.Errorf("priorities = %v, want empty", got.Priorities)
+	}
+}
+
+// --- ReadDB: TableRows ---
+
+func TestReadDB_TableRowsCountsAllTablesRegardlessOfConfig(t *testing.T) {
+	dbPath := newFixtureDB(t)
+	// config には instant_type だけを登録する。TableRows は config と無関係に
+	// DB内の全テーブルを数えるため、未登録のテーブルも出るはず。
+	cfg := &config.Config{Types: map[string]config.TypeConfig{"instant_type": instantTypeConfig()}}
+
+	got, err := ReadDB(dbPath, cfg, nil)
+	if err != nil {
+		t.Fatalf("ReadDB: %v", err)
+	}
+
+	want := map[string]int64{
+		"application_info_table": 1,
+		"hc_instant":             2,
+		"hc_interval":            1,
+		"hc_series_parent":       1,
+		"hc_series_child":        3,
+		"CamelSeriesParent":      1,
+		"camel_series_child":     1,
+	}
+	if !reflect.DeepEqual(got.TableRows, want) {
+		t.Fatalf("TableRows mismatch\n got: %#v\nwant: %#v", got.TableRows, want)
+	}
+}
+
+func TestReadDB_TableRowsIncludesEmptyTablesAndExcludesNonTables(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tables.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	ddl := []string{
+		// AUTOINCREMENT により sqlite_sequence が作られる。除外されるはず。
+		`CREATE TABLE filled (row_id INTEGER PRIMARY KEY AUTOINCREMENT, v INTEGER)`,
+		`CREATE TABLE empty_table (v INTEGER)`,
+		// 二重引用符を含むテーブル名でもクォートが壊れないことを確認する。
+		`CREATE TABLE "we""ird" (v INTEGER)`,
+		// LIKE の `_` をワイルドカードのまま使うと、これが sqlite_% に当たって
+		// 落ちる。SQLite の内部テーブルではないので出るはず。
+		`CREATE TABLE sqliteX_not_internal (v INTEGER)`,
+		`CREATE INDEX idx_filled_v ON filled (v)`,
+		`CREATE VIEW filled_view AS SELECT v FROM filled`,
+	}
+	for _, stmt := range ddl {
+		if _, err := db.Exec(stmt); err != nil {
+			t.Fatalf("exec ddl %q: %v", stmt, err)
+		}
+	}
+	if _, err := db.Exec(`INSERT INTO filled (v) VALUES (1), (2)`); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO "we""ird" (v) VALUES (9)`); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+
+	got, err := ReadDB(path, &config.Config{Types: map[string]config.TypeConfig{}}, nil)
+	if err != nil {
+		t.Fatalf("ReadDB: %v", err)
+	}
+
+	want := map[string]int64{
+		"filled":               2,
+		"empty_table":          0,
+		`we"ird`:               1,
+		"sqliteX_not_internal": 0,
+	}
+	if !reflect.DeepEqual(got.TableRows, want) {
+		t.Fatalf("TableRows mismatch\n got: %#v\nwant: %#v", got.TableRows, want)
+	}
+}
+
+func TestQuoteIdentifier(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"plain", `"plain"`},
+		{`we"ird`, `"we""ird"`},
+		{`a"b"c`, `"a""b""c"`},
+	}
+	for _, c := range cases {
+		if got := quoteIdentifier(c.in); got != c.want {
+			t.Errorf("quoteIdentifier(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+func TestReadDB_TableRowsSkipsFailingTableAndLogs(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "broken.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	// sqlite_master へ直接書いて、COUNT が失敗するテーブル（存在しないモジュールの
+	// 仮想テーブル）を作る。破損したテーブルが1つあっても取り込みを止めないこと。
+	stmts := []string{
+		`CREATE TABLE ok_table (v INTEGER)`,
+		`INSERT INTO ok_table VALUES (1)`,
+		`PRAGMA writable_schema=ON`,
+		`INSERT INTO sqlite_master (type, name, tbl_name, rootpage, sql)
+			VALUES ('table', 'ghost', 'ghost', 0, 'CREATE VIRTUAL TABLE ghost USING nosuchmodule(x)')`,
+		`PRAGMA writable_schema=OFF`,
+	}
+	for _, stmt := range stmts {
+		if _, err := db.Exec(stmt); err != nil {
+			t.Fatalf("exec %q: %v", stmt, err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn}))
+
+	got, err := ReadDB(path, &config.Config{Types: map[string]config.TypeConfig{}}, logger)
+	if err != nil {
+		t.Fatalf("ReadDB: %v", err)
+	}
+
+	want := map[string]int64{"ok_table": 1}
+	if !reflect.DeepEqual(got.TableRows, want) {
+		t.Fatalf("TableRows mismatch\n got: %#v\nwant: %#v", got.TableRows, want)
+	}
+	if !strings.Contains(logs.String(), "ghost") {
+		t.Errorf("log does not mention the failing table: %q", logs.String())
 	}
 }

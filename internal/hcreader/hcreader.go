@@ -8,6 +8,7 @@ import (
 	"database/sql"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -35,6 +36,8 @@ var tableNameRe = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_]*$`)
 // Reader は internal/app の Reader インターフェースを満たす。
 type Reader struct {
 	TempDir string
+	// Logger は nil なら slog.Default() を使う。
+	Logger *slog.Logger
 }
 
 // Read は zip を TempDir 配下に展開してから読み、一時ファイルを必ず削除する。
@@ -55,7 +58,7 @@ func (r *Reader) Read(zipFile *model.ZipFile, cfg *config.Config) (*model.Export
 		return nil, err
 	}
 
-	return ReadDB(dbPath, cfg)
+	return ReadDB(dbPath, cfg, r.Logger)
 }
 
 // ExtractDB は zipData の中から拡張子 ".db" のエントリ（複数あれば最大サイズのもの）を
@@ -104,7 +107,12 @@ func ExtractDB(zipData []byte, destPath string) error {
 }
 
 // ReadDB は展開済みのエクスポートDBを cfg の種別定義に従って読む。
-func ReadDB(dbPath string, cfg *config.Config) (*model.ExportData, error) {
+// logger は nil なら slog.Default() を使う。
+func ReadDB(dbPath string, cfg *config.Config, logger *slog.Logger) (*model.ExportData, error) {
+	if logger == nil {
+		logger = slog.Default()
+	}
+
 	db, err := sql.Open("sqlite", fmt.Sprintf("file:%s?mode=ro", dbPath))
 	if err != nil {
 		return nil, fmt.Errorf("hcreader: open %s: %w", dbPath, err)
@@ -125,7 +133,64 @@ func ReadDB(dbPath string, cfg *config.Config) (*model.ExportData, error) {
 		return nil, err
 	}
 
-	return &model.ExportData{Records: records, Priorities: prios}, nil
+	tableRows, err := readTableRows(db, logger)
+	if err != nil {
+		return nil, err
+	}
+
+	return &model.ExportData{Records: records, Priorities: prios, TableRows: tableRows}, nil
+}
+
+// readTableRows はエクスポートDB内の全テーブルの行数を数える。config に登録済みの
+// 種別へ絞らないのは、登録していないテーブルへ書き込みが始まったことに気づくのが
+// 目的だから。名前の形（*_record_table など）でも絞らない。エクスポートDBは
+// CamelCase のテーブルも持つため、形で絞ると取りこぼす。
+func readTableRows(db *sql.DB, logger *slog.Logger) (map[string]int64, error) {
+	// LIKE の `_` は任意1文字に当たるため ESCAPE で literal にする。エスケープ
+	// しないと sqlite + 任意1文字で始まる実在のテーブルまで除外され、未登録の
+	// テーブルに気づくというこの関数の目的を損なう。
+	rows, err := db.Query(
+		`SELECT name FROM sqlite_master
+		 WHERE type = 'table' AND name NOT LIKE 'sqlite\_%' ESCAPE '\'
+		 ORDER BY name`,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("hcreader: list tables: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var names []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, fmt.Errorf("hcreader: scan table name: %w", err)
+		}
+		names = append(names, name)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("hcreader: list tables: %w", err)
+	}
+
+	counts := make(map[string]int64, len(names))
+	for _, name := range names {
+		var n int64
+		// テーブル名はプレースホルダに置けないため連結する。sqlite_master から
+		// 得た実在の名前だが、クォートと `"` のエスケープで識別子として閉じる。
+		q := fmt.Sprintf(`SELECT COUNT(*) FROM %s`, quoteIdentifier(name))
+		if err := db.QueryRow(q).Scan(&n); err != nil {
+			// 1テーブルの破損で取り込み全体を止めない。
+			logger.Warn("テーブルの件数取得に失敗", "table", name, "error", err)
+			continue
+		}
+		counts[name] = n
+	}
+	return counts, nil
+}
+
+// quoteIdentifier は SQLite の識別子を二重引用符で囲む。名前に含まれる `"` は
+// `""` へエスケープする。
+func quoteIdentifier(name string) string {
+	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
 }
 
 const priorityTable = "health_data_category_priority_table"

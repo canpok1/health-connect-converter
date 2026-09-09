@@ -125,7 +125,7 @@ UPSERT は `INSERT ... ON CONFLICT(uuid) DO UPDATE`。トランザクション�
 |---|---|---|
 | `daily_summary` | 1行/日。全種別の集約を横持ち（`date, bp_sys_mean, bp_dia_mean, hr_mean, hr_resting, sleep_total_min, sleep_deep_min, steps, weight_kg, ...`） | 全期間 |
 | `<種別>_raw` | 種別ごとの生データ（`bp_raw`, `hr_raw`, `sleep_stages`, `steps_raw` ...） | 種別ごとの窓 |
-| `_meta` | 最終成功時刻／処理した ZIP の日時／種別ごとの最新レコード日時と件数 | — |
+| `_meta` | 最終成功時刻／処理した ZIP の日時／種別ごとの最新レコード日時と件数／エクスポートDBの全テーブルの行数（`export_<テーブル名>_rows`） | — |
 
 傾向の振り返りと相関分析は `daily_summary` 1枚でほぼ完結する。生データタブはそこから深掘りするときに使う。
 

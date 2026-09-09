@@ -401,7 +401,7 @@ func TestBuildMeta_RowOrderAndZeroCountLatestIsEmpty(t *testing.T) {
 	lastSuccess := time.Date(2024, 6, 1, 10, 0, 0, 0, time.UTC)
 	zipModified := time.Date(2024, 5, 31, 9, 0, 0, 0, time.UTC)
 
-	got, err := BuildMeta(context.Background(), q, cfg, lastSuccess, zipModified)
+	got, err := BuildMeta(context.Background(), q, cfg, lastSuccess, zipModified, nil)
 	if err != nil {
 		t.Fatalf("BuildMeta: %v", err)
 	}
@@ -425,7 +425,7 @@ func TestBuildMeta_ZeroLastSuccessIsEmptyString(t *testing.T) {
 	cfg := &config.Config{Types: map[string]config.TypeConfig{}}
 	q := &fakeQuerier{}
 
-	got, err := BuildMeta(context.Background(), q, cfg, time.Time{}, time.Time{})
+	got, err := BuildMeta(context.Background(), q, cfg, time.Time{}, time.Time{}, nil)
 	if err != nil {
 		t.Fatalf("BuildMeta: %v", err)
 	}
@@ -435,6 +435,39 @@ func TestBuildMeta_ZeroLastSuccessIsEmptyString(t *testing.T) {
 		{"last_success_at", ""},
 		{"last_processed_zip_modified_time", ""},
 		{"generated_at", ""},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("rows mismatch\n got: %#v\nwant: %#v", got, want)
+	}
+}
+
+func TestBuildMeta_ExportTableRowsSortedAndIncludesZero(t *testing.T) {
+	cfg := &config.Config{Types: map[string]config.TypeConfig{
+		"a": typeConfigForRaw("all", false, "v"),
+	}}
+	q := &fakeQuerier{stats: map[string]model.TypeStats{"a": {Count: 1, LatestStartTime: 0}}}
+	tableRows := map[string]int64{
+		"steps_record_table": 12,
+		"CamelRecordTable":   0,
+		"application_info":   3,
+	}
+
+	got, err := BuildMeta(context.Background(), q, cfg, time.Time{}, time.Time{}, tableRows)
+	if err != nil {
+		t.Fatalf("BuildMeta: %v", err)
+	}
+
+	want := [][]any{
+		{"key", "value"},
+		{"last_success_at", ""},
+		{"last_processed_zip_modified_time", ""},
+		{"generated_at", ""},
+		{"a_record_count", int64(1)},
+		{"a_latest_record_at", ""},
+		// テーブル名の昇順。大文字は Go の文字列順で小文字より前に来る。
+		{"export_CamelRecordTable_rows", int64(0)},
+		{"export_application_info_rows", int64(3)},
+		{"export_steps_record_table_rows", int64(12)},
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("rows mismatch\n got: %#v\nwant: %#v", got, want)
