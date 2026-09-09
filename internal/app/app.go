@@ -131,7 +131,7 @@ func (a *App) RunOnce(ctx context.Context) error {
 	}
 
 	lastSuccess := a.now()
-	if err := a.writeMeta(ctx, lastSuccess, zip.ModifiedTime); err != nil {
+	if err := a.writeMeta(ctx, lastSuccess, zip.ModifiedTime, data.TableRows); err != nil {
 		return err
 	}
 
@@ -203,8 +203,8 @@ func (a *App) ensureDailySummaryFirst(ctx context.Context) error {
 	return nil
 }
 
-func (a *App) writeMeta(ctx context.Context, lastSuccess, zipModified time.Time) error {
-	rows, err := report.BuildMeta(ctx, a.st, a.cfg, lastSuccess, zipModified)
+func (a *App) writeMeta(ctx context.Context, lastSuccess, zipModified time.Time, tableRows map[string]int64) error {
+	rows, err := report.BuildMeta(ctx, a.st, a.cfg, lastSuccess, zipModified, tableRows)
 	if err != nil {
 		return fmt.Errorf("app: build meta: %w", err)
 	}

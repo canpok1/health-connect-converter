@@ -175,7 +175,15 @@ const (
 )
 
 // BuildMeta は _meta タブの行列を作る。
-func BuildMeta(ctx context.Context, q Querier, cfg *config.Config, lastSuccess, zipModified time.Time) ([][]any, error) {
+// tableRows はエクスポートDB内の全テーブルの行数（テーブル名がキー）。累積DB由来の
+// <種別>_record_count と混ざらないよう export_<テーブル名>_rows として末尾へ出す。
+func BuildMeta(
+	ctx context.Context,
+	q Querier,
+	cfg *config.Config,
+	lastSuccess, zipModified time.Time,
+	tableRows map[string]int64,
+) ([][]any, error) {
 	lastSuccessStr := formatRFC3339OrEmpty(lastSuccess)
 
 	out := [][]any{
@@ -200,6 +208,15 @@ func BuildMeta(ctx context.Context, q Querier, cfg *config.Config, lastSuccess, 
 			[]any{tk + "_record_count", stats.Count},
 			[]any{tk + "_latest_record_at", latest},
 		)
+	}
+
+	tableNames := make([]string, 0, len(tableRows))
+	for name := range tableRows {
+		tableNames = append(tableNames, name)
+	}
+	sort.Strings(tableNames)
+	for _, name := range tableNames {
+		out = append(out, []any{"export_" + name + "_rows", tableRows[name]})
 	}
 
 	return out, nil

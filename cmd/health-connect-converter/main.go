@@ -126,7 +126,7 @@ func run(ctx context.Context, once bool, getenv func(string) string) error {
 		return fmt.Errorf("create sheets sink: %w", err)
 	}
 
-	rd := &hcreader.Reader{TempDir: filepath.Join(filepath.Dir(opt.DBPath), "tmp")}
+	rd := &hcreader.Reader{TempDir: filepath.Join(filepath.Dir(opt.DBPath), "tmp"), Logger: logger}
 
 	a := app.New(cfg, src, rd, st, sink, logger, nil)
 
