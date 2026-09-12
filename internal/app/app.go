@@ -9,7 +9,7 @@ import (
 	"log/slog"
 	"time"
 
-	"health-connect-converter/internal/config"
+	"health-connect-converter/internal/kind"
 	"health-connect-converter/internal/model"
 	"health-connect-converter/internal/report"
 )
@@ -26,19 +26,18 @@ type Source interface {
 	FetchLatest(ctx context.Context, after time.Time) (*model.ZipFile, error)
 }
 
-// Reader はZIPから種別ごとのレコードを読み出す。internal/hcreader が満たす。
-type Reader interface {
-	Read(zip *model.ZipFile, cfg *config.Config) (*model.ExportData, error)
+// Ingester はZIPを展開して全種別を累積DBへ取り込み、付随情報を返す。
+// internal/ingest が満たす。
+type Ingester interface {
+	Ingest(ctx context.Context, zip *model.ZipFile) (*model.ExportInfo, error)
 }
 
 // Store は累積DBと state の永続化。internal/store が満たす。
 // report.Querier のメソッドを含むため、そのまま report.Querier として渡せる。
 type Store interface {
-	ReplaceRecords(ctx context.Context, typeKey string, tc config.TypeConfig, recs []model.Record) (int, error)
-	SetAppPriorities(ctx context.Context, prios model.AppPriorities) error
-	DailyAggregates(ctx context.Context, typeKey string, tc config.TypeConfig) ([]model.DailyRow, error)
-	RecordsSince(ctx context.Context, typeKey string, tc config.TypeConfig, sinceMs int64) ([]model.Record, error)
-	TypeStats(ctx context.Context, typeKey string) (model.TypeStats, error)
+	DailyAggregates(ctx context.Context, k kind.Kind) ([]model.DailyRow, error)
+	RawRows(ctx context.Context, k kind.Kind, sinceMs int64) ([][]any, error)
+	Stats(ctx context.Context, k kind.Kind) (model.TypeStats, error)
 	GetState(ctx context.Context, key string) (string, error)
 	SetState(ctx context.Context, key, value string) error
 }
@@ -51,9 +50,9 @@ type Sink interface {
 
 // App は1周ぶんの処理とポーリングループを持つ。
 type App struct {
-	cfg    *config.Config
+	kinds  []kind.Kind
 	src    Source
-	rd     Reader
+	ing    Ingester
 	st     Store
 	sink   Sink
 	logger *slog.Logger
@@ -67,14 +66,14 @@ type App struct {
 }
 
 // New はAppを組み立てる。now が nil なら time.Now を使う。
-func New(cfg *config.Config, src Source, rd Reader, st Store, sink Sink, logger *slog.Logger, now func() time.Time) *App {
+func New(kinds []kind.Kind, src Source, ing Ingester, st Store, sink Sink, logger *slog.Logger, now func() time.Time) *App {
 	if now == nil {
 		now = time.Now
 	}
 	return &App{
-		cfg:    cfg,
+		kinds:  kinds,
 		src:    src,
-		rd:     rd,
+		ing:    ing,
 		st:     st,
 		sink:   sink,
 		logger: logger,
@@ -112,26 +111,9 @@ func (a *App) RunOnce(ctx context.Context) error {
 		"size", len(zip.Data),
 	)
 
-	data, err := a.rd.Read(zip, a.cfg)
+	info, err := a.ing.Ingest(ctx, zip)
 	if err != nil {
-		return fmt.Errorf("app: read zip: %w", err)
-	}
-
-	if err := a.st.SetAppPriorities(ctx, data.Priorities); err != nil {
-		return fmt.Errorf("app: save app priorities: %w", err)
-	}
-	a.logger.Info("アプリ優先度を取得", "categories", len(data.Priorities))
-
-	for _, tk := range a.cfg.TypeKeys() {
-		recs, ok := data.Records[tk]
-		if !ok {
-			continue
-		}
-		n, err := a.st.ReplaceRecords(ctx, tk, a.cfg.Types[tk], recs)
-		if err != nil {
-			return fmt.Errorf("app: replace records for %q: %w", tk, err)
-		}
-		a.logger.Info("取り込み完了", "type", tk, "count", n)
+		return fmt.Errorf("app: ingest: %w", err)
 	}
 
 	if err := a.writeDailySummary(ctx); err != nil {
@@ -142,7 +124,7 @@ func (a *App) RunOnce(ctx context.Context) error {
 	}
 
 	lastSuccess := a.now()
-	if err := a.writeMeta(ctx, lastSuccess, zip.ModifiedTime, data.TableRows); err != nil {
+	if err := a.writeMeta(ctx, lastSuccess, zip.ModifiedTime, info.TableRows); err != nil {
 		return err
 	}
 
@@ -180,7 +162,7 @@ func (a *App) lastProcessedModifiedTime(ctx context.Context) (time.Time, error) 
 }
 
 func (a *App) writeDailySummary(ctx context.Context) error {
-	rows, err := report.BuildDailySummary(ctx, a.st, a.cfg)
+	rows, err := report.BuildDailySummary(ctx, a.st, a.kinds)
 	if err != nil {
 		return fmt.Errorf("app: build daily summary: %w", err)
 	}
@@ -192,12 +174,12 @@ func (a *App) writeDailySummary(ctx context.Context) error {
 }
 
 func (a *App) writeRawTabs(ctx context.Context) error {
-	for _, tk := range a.cfg.TypeKeys() {
-		rows, err := report.BuildRawTab(ctx, a.st, a.cfg, tk, a.now())
+	for _, k := range a.kinds {
+		rows, err := report.BuildRawTab(ctx, a.st, k, a.now())
 		if err != nil {
-			return fmt.Errorf("app: build raw tab for %q: %w", tk, err)
+			return fmt.Errorf("app: build raw tab for %q: %w", k.Key(), err)
 		}
-		title := report.RawTabTitle(tk)
+		title := report.RawTabTitle(k.Key())
 		if err := a.sink.WriteTab(ctx, title, rows); err != nil {
 			return fmt.Errorf("app: write tab %q: %w", title, err)
 		}
@@ -219,7 +201,7 @@ func (a *App) ensureDailySummaryFirst(ctx context.Context) error {
 }
 
 func (a *App) writeMeta(ctx context.Context, lastSuccess, zipModified time.Time, tableRows map[string]int64) error {
-	rows, err := report.BuildMeta(ctx, a.st, a.cfg, lastSuccess, zipModified, tableRows)
+	rows, err := report.BuildMeta(ctx, a.st, a.kinds, lastSuccess, zipModified, tableRows)
 	if err != nil {
 		return fmt.Errorf("app: build meta: %w", err)
 	}

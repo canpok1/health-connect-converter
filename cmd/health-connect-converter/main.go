@@ -17,9 +17,9 @@ import (
 	_ "time/tzdata"
 
 	"health-connect-converter/internal/app"
-	"health-connect-converter/internal/config"
 	"health-connect-converter/internal/drivesource"
-	"health-connect-converter/internal/hcreader"
+	"health-connect-converter/internal/ingest"
+	"health-connect-converter/internal/kind"
 	"health-connect-converter/internal/sheetssink"
 	"health-connect-converter/internal/store"
 )
@@ -39,17 +39,15 @@ type options struct {
 	SpreadsheetID string
 	SAKeyPath     string
 	DBPath        string
-	ConfigPath    string
 	PollInterval  time.Duration
 	LogLevel      string
 }
 
 func parseOptions(getenv func(string) string) (options, error) {
 	opt := options{
-		SAKeyPath:  envOrDefault(getenv, "HC_SA_KEY_PATH", "/run/secrets/sa-key.json"),
-		DBPath:     envOrDefault(getenv, "HC_DB_PATH", "/data/health.db"),
-		ConfigPath: envOrDefault(getenv, "HC_CONFIG_PATH", "/app/config.yaml"),
-		LogLevel:   envOrDefault(getenv, "HC_LOG_LEVEL", "info"),
+		SAKeyPath: envOrDefault(getenv, "HC_SA_KEY_PATH", "/run/secrets/sa-key.json"),
+		DBPath:    envOrDefault(getenv, "HC_DB_PATH", "/data/health.db"),
+		LogLevel:  envOrDefault(getenv, "HC_LOG_LEVEL", "info"),
 	}
 
 	opt.DriveFolderID = getenv("HC_DRIVE_FOLDER_ID")
@@ -101,10 +99,7 @@ func run(ctx context.Context, once bool, getenv func(string) string) error {
 		logger.Warn("未知のHC_LOG_LEVEL。infoにフォールバックする", "value", opt.LogLevel)
 	}
 
-	cfg, err := config.Load(opt.ConfigPath)
-	if err != nil {
-		return fmt.Errorf("load config: %w", err)
-	}
+	kinds := kind.All()
 
 	st, err := store.Open(opt.DBPath)
 	if err != nil {
@@ -112,7 +107,7 @@ func run(ctx context.Context, once bool, getenv func(string) string) error {
 	}
 	defer func() { _ = st.Close() }()
 
-	if err := st.Migrate(ctx, cfg); err != nil {
+	if err := st.Migrate(ctx, kinds); err != nil {
 		return fmt.Errorf("migrate store: %w", err)
 	}
 
@@ -126,16 +121,20 @@ func run(ctx context.Context, once bool, getenv func(string) string) error {
 		return fmt.Errorf("create sheets sink: %w", err)
 	}
 
-	rd := &hcreader.Reader{TempDir: filepath.Join(filepath.Dir(opt.DBPath), "tmp"), Logger: logger}
+	ing := &ingest.Ingester{
+		Kinds:   kinds,
+		Store:   st,
+		TempDir: filepath.Join(filepath.Dir(opt.DBPath), "tmp"),
+		Logger:  logger,
+	}
 
-	a := app.New(cfg, src, rd, st, sink, logger, nil)
+	a := app.New(kinds, src, ing, st, sink, logger, nil)
 
 	logger.Info("起動",
-		"config_path", opt.ConfigPath,
 		"db_path", opt.DBPath,
 		"poll_interval", opt.PollInterval,
 		"once", once,
-		"types", len(cfg.Types),
+		"types", len(kinds),
 	)
 
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)

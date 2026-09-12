@@ -3,16 +3,6 @@ package model
 
 import "time"
 
-// Record は種別によらない正規化済みの1レコード。
-type Record struct {
-	UUID       string
-	StartTime  int64 // UTC epoch ms
-	EndTime    int64 // UTC epoch ms。瞬時値の種別は StartTime と同値
-	ZoneOffset int32 // 記録時のタイムゾーンオフセット（秒）
-	AppID      string
-	Values     map[string]float64
-}
-
 // ZipFile は Drive から取得したエクスポートZIP。
 type ZipFile struct {
 	FileID       string
@@ -25,13 +15,12 @@ type ZipFile struct {
 // キーは Health Connect のカテゴリ整数（config.Categories の値）。
 type AppPriorities map[int][]string
 
-// ExportData はエクスポートDBから読み出した内容一式。
-type ExportData struct {
-	Records    map[string][]Record
-	Priorities AppPriorities
+// ExportInfo はエクスポートDB由来の付随情報。種別のデータ本体は種別ごとの
+// モデルとして累積DBへ入るため、ここには含めない。
+type ExportInfo struct {
 	// TableRows はエクスポートDB内の全テーブルの行数。テーブル名がキー。
-	// config に登録していないテーブルへ書き込みが始まったことに気づけるよう、
-	// 種別定義とは無関係にDB内のテーブルをすべて数える。
+	// 取り込み対象に登録していないテーブルへ書き込みが始まったことに気づけるよう、
+	// 種別の定義とは無関係にDB内のテーブルをすべて数える。
 	TableRows map[string]int64
 }
 

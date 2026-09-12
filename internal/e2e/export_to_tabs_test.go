@@ -13,14 +13,16 @@ package e2e
 import (
 	"context"
 	"encoding/json"
+	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
-	"health-connect-converter/internal/config"
 	"health-connect-converter/internal/hcreader"
+	"health-connect-converter/internal/kind"
 	"health-connect-converter/internal/report"
 	"health-connect-converter/internal/store"
 )
@@ -29,15 +31,14 @@ import (
 var fixedNow = time.Date(2026, 9, 12, 12, 0, 0, 0, time.UTC)
 
 func TestExportToTabs(t *testing.T) {
-	cfg, err := config.Load(filepath.Join("..", "..", "config.yaml"))
-	if err != nil {
-		t.Fatalf("config.Load: %v", err)
-	}
+	ctx := context.Background()
+	kinds := kind.All()
 
-	data, err := hcreader.ReadDB(newExportFixture(t), cfg, nil)
+	exportDB, err := hcreader.Open(newExportFixture(t))
 	if err != nil {
-		t.Fatalf("hcreader.ReadDB: %v", err)
+		t.Fatalf("hcreader.Open: %v", err)
 	}
+	defer func() { _ = exportDB.Close() }()
 
 	st, err := store.Open(filepath.Join(t.TempDir(), "cumulative.db"))
 	if err != nil {
@@ -45,42 +46,52 @@ func TestExportToTabs(t *testing.T) {
 	}
 	defer func() { _ = st.Close() }()
 
-	ctx := context.Background()
-	if err := st.Migrate(ctx, cfg); err != nil {
+	if err := st.Migrate(ctx, kinds); err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	if err := st.SetAppPriorities(ctx, data.Priorities); err != nil {
+
+	prios, err := hcreader.ReadAppPriorities(ctx, exportDB)
+	if err != nil {
+		t.Fatalf("ReadAppPriorities: %v", err)
+	}
+	if err := st.SetAppPriorities(ctx, prios); err != nil {
 		t.Fatalf("SetAppPriorities: %v", err)
 	}
-	for _, tk := range cfg.TypeKeys() {
-		recs, ok := data.Records[tk]
-		if !ok {
-			continue
-		}
-		if _, err := st.ReplaceRecords(ctx, tk, cfg.Types[tk], recs); err != nil {
-			t.Fatalf("ReplaceRecords(%s): %v", tk, err)
+	tableRows, err := hcreader.ReadTableRows(ctx, exportDB, discardLogger())
+	if err != nil {
+		t.Fatalf("ReadTableRows: %v", err)
+	}
+
+	for _, k := range kinds {
+		if _, err := st.Ingest(ctx, k, exportDB); err != nil {
+			t.Fatalf("Ingest(%s): %v", k.Key(), err)
 		}
 	}
 
-	daily, err := report.BuildDailySummary(ctx, st, cfg)
+	daily, err := report.BuildDailySummary(ctx, st, kinds)
 	if err != nil {
 		t.Fatalf("BuildDailySummary: %v", err)
 	}
 	compareGolden(t, report.DailySummaryTitle, daily)
 
-	for _, tk := range cfg.TypeKeys() {
-		rows, err := report.BuildRawTab(ctx, st, cfg, tk, fixedNow)
+	for _, k := range kinds {
+		rows, err := report.BuildRawTab(ctx, st, k, fixedNow)
 		if err != nil {
-			t.Fatalf("BuildRawTab(%s): %v", tk, err)
+			t.Fatalf("BuildRawTab(%s): %v", k.Key(), err)
 		}
-		compareGolden(t, report.RawTabTitle(tk), rows)
+		compareGolden(t, report.RawTabTitle(k.Key()), rows)
 	}
 
-	meta, err := report.BuildMeta(ctx, st, cfg, fixedNow, fixedNow, data.TableRows)
+	meta, err := report.BuildMeta(ctx, st, kinds, fixedNow, fixedNow, tableRows)
 	if err != nil {
 		t.Fatalf("BuildMeta: %v", err)
 	}
 	compareGolden(t, report.MetaTitle, meta)
+}
+
+// discardLogger はテスト中のログを捨てる。
+func discardLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
 // compareGolden は行列を testdata/<name>.json と突き合わせる。

@@ -96,7 +96,8 @@ func newExportFixture(t *testing.T) string {
 	interval("distance_record_table", "distance")
 	interval("total_calories_burned_record_table", "energy")
 	interval("sleep_session_record_table")
-	interval("exercise_session_record_table")
+	// 運動は種目（exercise_type）も持つ。保存はするが出力しない。
+	interval("exercise_session_record_table", "exercise_type")
 
 	// 親子2表の種別。親は値列を持たない。
 	interval("heart_rate_record_table")
@@ -165,7 +166,7 @@ func newExportFixture(t *testing.T) string {
 	intervalRow("total_calories_burned_record_table", "energy", jst(2026, 9, 11, 0, 0), jst(2026, 9, 11, 23, 59), 1, 1749366.5) // カロリー → kcal
 	// 睡眠: 日付をまたぐ。起床日（9/11）に数える。
 	intervalRow("sleep_session_record_table", "", jst(2026, 9, 10, 23, 0), jst(2026, 9, 11, 6, 30), 4)
-	intervalRow("exercise_session_record_table", "", jst(2026, 9, 11, 13, 0), jst(2026, 9, 11, 13, 30), 1)
+	intervalRow("exercise_session_record_table", "exercise_type", jst(2026, 9, 11, 13, 0), jst(2026, 9, 11, 13, 30), 1, 53)
 
 	// --- 親子2表の種別 ---
 	intervalRow("heart_rate_record_table", "", jst(2026, 9, 11, 22, 0), jst(2026, 9, 11, 23, 0), 2)

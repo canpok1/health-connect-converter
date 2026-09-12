@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"log/slog"
 	"slices"
@@ -9,7 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"health-connect-converter/internal/config"
+	"health-connect-converter/internal/cumdb"
+	"health-connect-converter/internal/kind"
 	"health-connect-converter/internal/model"
 	"health-connect-converter/internal/report"
 )
@@ -36,41 +38,49 @@ func (f *fakeSource) FetchLatest(_ context.Context, after time.Time) (*model.Zip
 	return f.zip, nil
 }
 
-type fakeReader struct {
-	recs      map[string][]model.Record
-	prios     model.AppPriorities
+type fakeIngester struct {
 	tableRows map[string]int64
 	err       error
 	calls     int
 }
 
-func (f *fakeReader) Read(_ *model.ZipFile, _ *config.Config) (*model.ExportData, error) {
+func (f *fakeIngester) Ingest(context.Context, *model.ZipFile) (*model.ExportInfo, error) {
 	f.calls++
 	if f.err != nil {
 		return nil, f.err
 	}
-	return &model.ExportData{Records: f.recs, Priorities: f.prios, TableRows: f.tableRows}, nil
+	return &model.ExportInfo{TableRows: f.tableRows}, nil
 }
 
-type upsertCall struct {
-	typeKey string
-	recs    []model.Record
+// fakeKind は app が見る部分（キーと方針）だけを持つテスト用の種別。
+type fakeKind struct {
+	key string
+}
+
+func (k fakeKind) Key() string { return k.key }
+func (k fakeKind) Policy() kind.Policy {
+	return kind.Policy{Window: kind.WindowAll, Daily: []string{kind.FuncSum}}
+}
+func (k fakeKind) ValueNames() []string { return []string{"v"} }
+func (k fakeKind) RawHeader() []any     { return []any{"local_date", "v"} }
+func (k fakeKind) Table() cumdb.Table   { return cumdb.Table{} }
+func (k fakeKind) ExportRows(context.Context, *sql.DB) ([][]any, []string, error) {
+	return nil, nil, nil
+}
+func (k fakeKind) Aggregate(context.Context, *sql.DB) ([]model.AggRecord, error) { return nil, nil }
+func (k fakeKind) RawRows(context.Context, *sql.DB, int64) ([][]any, error)      { return nil, nil }
+
+func testKinds() []kind.Kind {
+	return []kind.Kind{fakeKind{key: "steps"}, fakeKind{key: "weight"}}
 }
 
 type fakeStore struct {
 	state map[string]string
 
 	getStateErr error
-
-	upsertErr   error
-	upsertCalls []upsertCall
-
-	prios            model.AppPriorities
-	setPrioritiesErr error
-
-	dailyErr   error
-	recordsErr error
-	statsErr   error
+	dailyErr    error
+	rawErr      error
+	statsErr    error
 
 	setStateErr   error
 	setStateCalls []struct{ key, value string }
@@ -80,28 +90,15 @@ func newFakeStore() *fakeStore {
 	return &fakeStore{state: map[string]string{}}
 }
 
-func (f *fakeStore) SetAppPriorities(_ context.Context, prios model.AppPriorities) error {
-	f.prios = prios
-	return f.setPrioritiesErr
-}
-
-func (f *fakeStore) ReplaceRecords(_ context.Context, typeKey string, _ config.TypeConfig, recs []model.Record) (int, error) {
-	f.upsertCalls = append(f.upsertCalls, upsertCall{typeKey: typeKey, recs: recs})
-	if f.upsertErr != nil {
-		return 0, f.upsertErr
-	}
-	return len(recs), nil
-}
-
-func (f *fakeStore) DailyAggregates(_ context.Context, _ string, _ config.TypeConfig) ([]model.DailyRow, error) {
+func (f *fakeStore) DailyAggregates(context.Context, kind.Kind) ([]model.DailyRow, error) {
 	return nil, f.dailyErr
 }
 
-func (f *fakeStore) RecordsSince(_ context.Context, _ string, _ config.TypeConfig, _ int64) ([]model.Record, error) {
-	return nil, f.recordsErr
+func (f *fakeStore) RawRows(context.Context, kind.Kind, int64) ([][]any, error) {
+	return nil, f.rawErr
 }
 
-func (f *fakeStore) TypeStats(_ context.Context, _ string) (model.TypeStats, error) {
+func (f *fakeStore) Stats(context.Context, kind.Kind) (model.TypeStats, error) {
 	return model.TypeStats{}, f.statsErr
 }
 
@@ -189,29 +186,6 @@ func (l *logCapture) hasWarnWithAttrs(key, value string) bool {
 	return false
 }
 
-// --- テスト共通のセットアップ ---
-
-func testConfig() *config.Config {
-	return &config.Config{
-		Types: map[string]config.TypeConfig{
-			"steps": {
-				SourceTable: "steps_record",
-				TimeLayout:  config.LayoutInstant,
-				Columns:     map[string]config.ColumnConfig{"count": {Column: "count", Scale: 1}},
-				Window:      "all",
-				Daily:       []string{"sum"},
-			},
-			"weight": {
-				SourceTable: "weight_record",
-				TimeLayout:  config.LayoutInstant,
-				Columns:     map[string]config.ColumnConfig{"kg": {Column: "weight", Scale: 1}},
-				Window:      "all",
-				Daily:       []string{"mean"},
-			},
-		},
-	}
-}
-
 func discardLogger() *slog.Logger {
 	return slog.New(&logCapture{})
 }
@@ -222,92 +196,53 @@ func fixedNowFunc(t time.Time) func() time.Time {
 
 // --- RunOnce のテスト ---
 
-func TestRunOnce_NoNewFile_NoOtherCalls(t *testing.T) {
+func TestRunOnce_NoNewFile_OnlyFixesTabOrder(t *testing.T) {
 	src := &fakeSource{zip: nil}
-	rd := &fakeReader{}
+	ing := &fakeIngester{}
 	st := newFakeStore()
 	sink := &fakeSink{}
 
-	a := New(testConfig(), src, rd, st, sink, discardLogger(), nil)
+	// 起動後の強制取り込みを消化させるため、あらかじめ1周させる。
+	a := New(testKinds(), src, ing, st, sink, discardLogger(), nil)
+	a.startupIngestDone = true
+
 	if err := a.RunOnce(context.Background()); err != nil {
 		t.Fatalf("RunOnce() error = %v", err)
 	}
 
-	if rd.calls != 0 {
-		t.Errorf("Reader.Read calls = %d, want 0", rd.calls)
-	}
-	if len(st.upsertCalls) != 0 {
-		t.Errorf("UpsertRecords calls = %d, want 0", len(st.upsertCalls))
+	if ing.calls != 0 {
+		t.Errorf("Ingest calls = %d, want 0", ing.calls)
 	}
 	if len(sink.calls) != 0 {
-		t.Errorf("Sink.WriteTab calls = %d, want 0", len(sink.calls))
+		t.Errorf("WriteTab calls = %d, want 0", len(sink.calls))
 	}
 	if len(st.setStateCalls) != 0 {
 		t.Errorf("SetState calls = %d, want 0", len(st.setStateCalls))
 	}
-
 	// タブ順の是正だけは新着の有無によらず行う。
 	if want := []string{report.DailySummaryTitle}; !slices.Equal(sink.moveTabCalls, want) {
-		t.Errorf("Sink.MoveTabFirst calls = %v, want %v", sink.moveTabCalls, want)
+		t.Errorf("MoveTabFirst calls = %v, want %v", sink.moveTabCalls, want)
 	}
 }
 
-// 人手で先頭にシートを挿入されても、新着ZIPを待たずに次の周回で是正する。
 func TestRunOnce_NoNewFile_MoveTabFirstFails(t *testing.T) {
 	src := &fakeSource{zip: nil}
-	st := newFakeStore()
 	sink := &fakeSink{moveErr: errors.New("boom")}
 
-	a := New(testConfig(), src, &fakeReader{}, st, sink, discardLogger(), nil)
+	a := New(testKinds(), src, &fakeIngester{}, newFakeStore(), sink, discardLogger(), nil)
+	a.startupIngestDone = true
+
 	if err := a.RunOnce(context.Background()); err == nil {
 		t.Fatal("RunOnce() error = nil, want error")
-	}
-}
-
-func TestRunOnce_MovesDailySummaryFirstAfterWriting(t *testing.T) {
-	src := &fakeSource{zip: &model.ZipFile{FileID: "f1", ModifiedTime: time.Now()}}
-	st := newFakeStore()
-	sink := &fakeSink{}
-
-	a := New(testConfig(), src, &fakeReader{}, st, sink, discardLogger(), nil)
-	if err := a.RunOnce(context.Background()); err != nil {
-		t.Fatalf("RunOnce() error = %v", err)
-	}
-
-	if want := []string{report.DailySummaryTitle}; !slices.Equal(sink.moveTabCalls, want) {
-		t.Fatalf("Sink.MoveTabFirst calls = %v, want %v", sink.moveTabCalls, want)
-	}
-	// タブを作る前に移動しても意味がないため、書き込みの後でなければならない。
-	if len(sink.calls) == 0 {
-		t.Fatal("WriteTab was not called")
-	}
-}
-
-// 是正に失敗したら state を進めない。次の周回で同じZIPを取り直して再試行する。
-func TestRunOnce_MoveTabFirstFails_NoStateUpdate(t *testing.T) {
-	src := &fakeSource{zip: &model.ZipFile{FileID: "f1", ModifiedTime: time.Now()}}
-	st := newFakeStore()
-	sink := &fakeSink{moveErr: errors.New("boom")}
-
-	a := New(testConfig(), src, &fakeReader{}, st, sink, discardLogger(), nil)
-	if err := a.RunOnce(context.Background()); err == nil {
-		t.Fatal("RunOnce() error = nil, want error")
-	}
-
-	if len(st.setStateCalls) != 0 {
-		t.Errorf("SetState calls = %d, want 0", len(st.setStateCalls))
 	}
 }
 
 func TestRunOnce_SecondCycle_FetchLatestReceivesStateTime(t *testing.T) {
 	want := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
-	zip := &model.ZipFile{FileID: "file-1", ModifiedTime: want}
-
-	src := &fakeSource{zip: zip}
+	src := &fakeSource{zip: &model.ZipFile{FileID: "file-1", ModifiedTime: want}}
 	st := newFakeStore()
 
-	a := New(testConfig(), src, &fakeReader{}, st, &fakeSink{}, discardLogger(), nil)
-	// 1周目で起動後の強制取り込みを消化する。
+	a := New(testKinds(), src, &fakeIngester{}, st, &fakeSink{}, discardLogger(), nil)
 	if err := a.RunOnce(context.Background()); err != nil {
 		t.Fatalf("RunOnce() 1周目 error = %v", err)
 	}
@@ -320,70 +255,86 @@ func TestRunOnce_SecondCycle_FetchLatestReceivesStateTime(t *testing.T) {
 		t.Fatalf("FetchLatest calls = %d, want 2", len(src.calls))
 	}
 	if !src.calls[0].IsZero() {
-		t.Errorf("1周目の FetchLatest after = %v, want zero", src.calls[0])
+		t.Errorf("1周目の after = %v, want zero", src.calls[0])
 	}
 	if !src.calls[1].Equal(want) {
-		t.Errorf("2周目の FetchLatest after = %v, want %v", src.calls[1], want)
+		t.Errorf("2周目の after = %v, want %v", src.calls[1], want)
+	}
+}
+
+func TestRunOnce_EmptyState_AfterIsZero(t *testing.T) {
+	src := &fakeSource{zip: nil}
+	a := New(testKinds(), src, &fakeIngester{}, newFakeStore(), &fakeSink{}, discardLogger(), nil)
+	if err := a.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce() error = %v", err)
+	}
+	if len(src.calls) != 1 || !src.calls[0].IsZero() {
+		t.Errorf("FetchLatest after = %v, want zero", src.calls)
+	}
+}
+
+func TestRunOnce_BrokenState_AfterIsZeroAndWarns(t *testing.T) {
+	src := &fakeSource{zip: nil}
+	st := newFakeStore()
+	st.state[stateKeyLastProcessedModifiedTime] = "not-a-valid-time"
+
+	capture := &logCapture{}
+	a := New(testKinds(), src, &fakeIngester{}, st, &fakeSink{}, slog.New(capture), nil)
+	a.startupIngestDone = true
+
+	if err := a.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce() error = %v", err)
+	}
+	if len(src.calls) != 1 || !src.calls[0].IsZero() {
+		t.Errorf("FetchLatest after = %v, want zero", src.calls)
+	}
+	if !capture.hasWarnWithAttrs(stateKeyLastProcessedModifiedTime, "not-a-valid-time") {
+		t.Errorf("壊れた state の警告が出ていない: %+v", capture.records)
 	}
 }
 
 // TestRunOnce_FirstCycleIngestsEvenWithoutNewZip は、state が最新ZIPと同じ時刻でも
-// 起動後の最初の1周は取り込むことを確認する（ADR 0010）。config を変えた直後に
-// 反映されるのはこの経路。
+// 起動後の最初の1周は取り込むことを確認する（ADR 0010）。
 func TestRunOnce_FirstCycleIngestsEvenWithoutNewZip(t *testing.T) {
 	modified := time.Date(2026, 9, 11, 16, 30, 56, 853000000, time.UTC)
-	zip := &model.ZipFile{FileID: "file-1", ModifiedTime: modified, Data: []byte("dummy")}
-
-	src := &fakeSource{zip: zip, respectAfter: true}
-	rd := &fakeReader{recs: map[string][]model.Record{"steps": {{UUID: "a"}}}}
+	src := &fakeSource{zip: &model.ZipFile{FileID: "file-1", ModifiedTime: modified}, respectAfter: true}
+	ing := &fakeIngester{}
 	st := newFakeStore()
 	st.state[stateKeyLastProcessedModifiedTime] = modified.Format(time.RFC3339Nano)
 
-	a := New(testConfig(), src, rd, st, &fakeSink{}, discardLogger(), nil)
+	a := New(testKinds(), src, ing, st, &fakeSink{}, discardLogger(), nil)
 	if err := a.RunOnce(context.Background()); err != nil {
 		t.Fatalf("RunOnce() error = %v", err)
 	}
-
-	if rd.calls != 1 {
-		t.Fatalf("Read calls = %d, want 1（新着が無くても取り込む）", rd.calls)
+	if ing.calls != 1 {
+		t.Fatalf("Ingest calls = %d, want 1（新着が無くても取り込む）", ing.calls)
 	}
 }
 
-// TestRunOnce_SecondCycleSkipsWhenNoNewZip は、強制取り込みが1周きりで、
-// 2周目以降は新着が無ければ取り込まないことを確認する。
 func TestRunOnce_SecondCycleSkipsWhenNoNewZip(t *testing.T) {
 	modified := time.Date(2026, 9, 11, 16, 30, 56, 853000000, time.UTC)
-	zip := &model.ZipFile{FileID: "file-1", ModifiedTime: modified, Data: []byte("dummy")}
+	src := &fakeSource{zip: &model.ZipFile{FileID: "file-1", ModifiedTime: modified}, respectAfter: true}
+	ing := &fakeIngester{}
 
-	src := &fakeSource{zip: zip, respectAfter: true}
-	rd := &fakeReader{recs: map[string][]model.Record{"steps": {{UUID: "a"}}}}
-	st := newFakeStore()
-
-	a := New(testConfig(), src, rd, st, &fakeSink{}, discardLogger(), nil)
+	a := New(testKinds(), src, ing, newFakeStore(), &fakeSink{}, discardLogger(), nil)
 	for i := 1; i <= 2; i++ {
 		if err := a.RunOnce(context.Background()); err != nil {
 			t.Fatalf("RunOnce() %d周目 error = %v", i, err)
 		}
 	}
-
-	if rd.calls != 1 {
-		t.Errorf("Read calls = %d, want 1（2周目は新着なしで取り込まない）", rd.calls)
+	if ing.calls != 1 {
+		t.Errorf("Ingest calls = %d, want 1（2周目は新着なし）", ing.calls)
 	}
 }
 
-// TestRunOnce_StartupIngestRetriedAfterFailure は、強制取り込みの周が失敗したら
-// 次の周でも強制することを確認する。起動直後にDriveやSheetsが落ちていたときに
-// 取りこぼさないため。
 func TestRunOnce_StartupIngestRetriedAfterFailure(t *testing.T) {
 	modified := time.Date(2026, 9, 11, 16, 30, 56, 853000000, time.UTC)
-	zip := &model.ZipFile{FileID: "file-1", ModifiedTime: modified, Data: []byte("dummy")}
-
-	src := &fakeSource{zip: zip, respectAfter: true}
+	src := &fakeSource{zip: &model.ZipFile{FileID: "file-1", ModifiedTime: modified}, respectAfter: true}
 	st := newFakeStore()
 	st.state[stateKeyLastProcessedModifiedTime] = modified.Format(time.RFC3339Nano)
 	sink := &fakeSink{err: errors.New("write boom")}
 
-	a := New(testConfig(), src, &fakeReader{}, st, sink, discardLogger(), nil)
+	a := New(testKinds(), src, &fakeIngester{}, st, sink, discardLogger(), nil)
 	if err := a.RunOnce(context.Background()); err == nil {
 		t.Fatal("RunOnce() 1周目 error = nil, want error")
 	}
@@ -392,12 +343,8 @@ func TestRunOnce_StartupIngestRetriedAfterFailure(t *testing.T) {
 	if err := a.RunOnce(context.Background()); err != nil {
 		t.Fatalf("RunOnce() 2周目 error = %v", err)
 	}
-
-	if len(src.calls) != 2 {
-		t.Fatalf("FetchLatest calls = %d, want 2", len(src.calls))
-	}
-	if !src.calls[1].IsZero() {
-		t.Errorf("2周目の FetchLatest after = %v, want zero（強制取り込みが未消化）", src.calls[1])
+	if len(src.calls) != 2 || !src.calls[1].IsZero() {
+		t.Errorf("2周目の after = %v, want zero（強制取り込みが未消化）", src.calls)
 	}
 }
 
@@ -406,12 +353,10 @@ func TestRunOnce_StartupIngestRetriedAfterFailure(t *testing.T) {
 // 「新着」と判定される。
 func TestRunOnce_StateKeepsMillisecondPrecision(t *testing.T) {
 	modified := time.Date(2026, 9, 11, 16, 30, 56, 853000000, time.UTC)
-	zip := &model.ZipFile{FileID: "file-1", ModifiedTime: modified, Data: []byte("dummy")}
-
-	src := &fakeSource{zip: zip}
+	src := &fakeSource{zip: &model.ZipFile{FileID: "file-1", ModifiedTime: modified}}
 	st := newFakeStore()
 
-	a := New(testConfig(), src, &fakeReader{}, st, &fakeSink{}, discardLogger(), nil)
+	a := New(testKinds(), src, &fakeIngester{}, st, &fakeSink{}, discardLogger(), nil)
 	if err := a.RunOnce(context.Background()); err != nil {
 		t.Fatalf("RunOnce() error = %v", err)
 	}
@@ -422,67 +367,16 @@ func TestRunOnce_StateKeepsMillisecondPrecision(t *testing.T) {
 	}
 }
 
-func TestRunOnce_EmptyState_AfterIsZero(t *testing.T) {
-	src := &fakeSource{zip: nil}
-	st := newFakeStore()
-
-	a := New(testConfig(), src, &fakeReader{}, st, &fakeSink{}, discardLogger(), nil)
-	if err := a.RunOnce(context.Background()); err != nil {
-		t.Fatalf("RunOnce() error = %v", err)
-	}
-
-	if len(src.calls) != 1 {
-		t.Fatalf("FetchLatest calls = %d, want 1", len(src.calls))
-	}
-	if !src.calls[0].IsZero() {
-		t.Errorf("FetchLatest after = %v, want zero", src.calls[0])
-	}
-}
-
-func TestRunOnce_BrokenState_AfterIsZeroAndWarns(t *testing.T) {
-	src := &fakeSource{zip: nil}
-	st := newFakeStore()
-	st.state[stateKeyLastProcessedModifiedTime] = "not-a-valid-time"
-
-	capture := &logCapture{}
-	logger := slog.New(capture)
-
-	a := New(testConfig(), src, &fakeReader{}, st, &fakeSink{}, logger, nil)
-	if err := a.RunOnce(context.Background()); err != nil {
-		t.Fatalf("RunOnce() error = %v", err)
-	}
-
-	if len(src.calls) != 1 {
-		t.Fatalf("FetchLatest calls = %d, want 1", len(src.calls))
-	}
-	if !src.calls[0].IsZero() {
-		t.Errorf("FetchLatest after = %v, want zero", src.calls[0])
-	}
-	if !capture.hasWarnWithAttrs(stateKeyLastProcessedModifiedTime, "not-a-valid-time") {
-		t.Errorf("expected Warn log for broken state, records = %+v", capture.records)
-	}
-}
-
-func TestRunOnce_Success_UpdatesStateAndWritesTabsInOrder(t *testing.T) {
+func TestRunOnce_Success_WritesTabsInOrderAndUpdatesState(t *testing.T) {
 	modified := time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC)
-	zip := &model.ZipFile{FileID: "file-1", Name: "export.zip", ModifiedTime: modified, Data: []byte("dummy")}
 	now := time.Date(2026, 3, 4, 6, 0, 0, 0, time.UTC)
-
-	src := &fakeSource{zip: zip}
-	rd := &fakeReader{recs: map[string][]model.Record{
-		"steps": {{UUID: "a", StartTime: 1000, EndTime: 1000, Values: map[string]float64{"count": 10}}},
-	}}
+	src := &fakeSource{zip: &model.ZipFile{FileID: "file-1", Name: "export.zip", ModifiedTime: modified}}
 	st := newFakeStore()
 	sink := &fakeSink{}
 
-	a := New(testConfig(), src, rd, st, sink, discardLogger(), fixedNowFunc(now))
+	a := New(testKinds(), src, &fakeIngester{}, st, sink, discardLogger(), fixedNowFunc(now))
 	if err := a.RunOnce(context.Background()); err != nil {
 		t.Fatalf("RunOnce() error = %v", err)
-	}
-
-	// steps のみ Read 結果にあるので UPSERT は1回だけ（weight はスキップ）。
-	if len(st.upsertCalls) != 1 || st.upsertCalls[0].typeKey != "steps" {
-		t.Errorf("upsertCalls = %+v, want only steps", st.upsertCalls)
 	}
 
 	wantTitles := []string{"daily_summary", "steps_raw", "weight_raw", "_meta"}
@@ -502,24 +396,23 @@ func TestRunOnce_Success_UpdatesStateAndWritesTabsInOrder(t *testing.T) {
 	for _, c := range st.setStateCalls {
 		got[c.key] = c.value
 	}
-	if got[stateKeyLastProcessedModifiedTime] != modified.Format(time.RFC3339) {
-		t.Errorf("last_processed_modified_time = %q, want %q", got[stateKeyLastProcessedModifiedTime], modified.Format(time.RFC3339))
+	if got[stateKeyLastProcessedModifiedTime] != modified.Format(time.RFC3339Nano) {
+		t.Errorf("last_processed_modified_time = %q", got[stateKeyLastProcessedModifiedTime])
 	}
 	if got[stateKeyLastProcessedFileID] != "file-1" {
-		t.Errorf("last_processed_file_id = %q, want %q", got[stateKeyLastProcessedFileID], "file-1")
+		t.Errorf("last_processed_file_id = %q, want file-1", got[stateKeyLastProcessedFileID])
 	}
 	if got[stateKeyLastSuccessAt] != now.Format(time.RFC3339) {
-		t.Errorf("last_success_at = %q, want %q", got[stateKeyLastSuccessAt], now.Format(time.RFC3339))
+		t.Errorf("last_success_at = %q", got[stateKeyLastSuccessAt])
 	}
 }
 
 func TestRunOnce_MetaIncludesExportTableRows(t *testing.T) {
-	zip := &model.ZipFile{FileID: "file-1", ModifiedTime: time.Now(), Data: []byte("dummy")}
-	src := &fakeSource{zip: zip}
-	rd := &fakeReader{tableRows: map[string]int64{"unregistered_table": 7}}
+	src := &fakeSource{zip: &model.ZipFile{FileID: "file-1", ModifiedTime: time.Now()}}
+	ing := &fakeIngester{tableRows: map[string]int64{"unregistered_table": 7}}
 	sink := &fakeSink{}
 
-	a := New(testConfig(), src, rd, newFakeStore(), sink, discardLogger(), nil)
+	a := New(testKinds(), src, ing, newFakeStore(), sink, discardLogger(), nil)
 	if err := a.RunOnce(context.Background()); err != nil {
 		t.Fatalf("RunOnce() error = %v", err)
 	}
@@ -533,7 +426,6 @@ func TestRunOnce_MetaIncludesExportTableRows(t *testing.T) {
 	if meta == nil {
 		t.Fatalf("_meta タブが書かれていない: %+v", sink.calls)
 	}
-
 	found := false
 	for _, row := range meta {
 		if len(row) == 2 && row[0] == "export_unregistered_table_rows" && row[1] == int64(7) {
@@ -545,17 +437,13 @@ func TestRunOnce_MetaIncludesExportTableRows(t *testing.T) {
 	}
 }
 
-func TestRunOnce_UpsertFails_NoStateUpdate(t *testing.T) {
-	zip := &model.ZipFile{FileID: "file-1", ModifiedTime: time.Now()}
-	src := &fakeSource{zip: zip}
-	rd := &fakeReader{recs: map[string][]model.Record{"steps": {{UUID: "a"}}}}
+func TestRunOnce_IngestFails_NoStateUpdate(t *testing.T) {
+	src := &fakeSource{zip: &model.ZipFile{FileID: "file-1", ModifiedTime: time.Now()}}
+	ing := &fakeIngester{err: errors.New("ingest boom")}
 	st := newFakeStore()
-	st.upsertErr = errors.New("upsert boom")
-	sink := &fakeSink{}
 
-	a := New(testConfig(), src, rd, st, sink, discardLogger(), nil)
-	err := a.RunOnce(context.Background())
-	if err == nil {
+	a := New(testKinds(), src, ing, st, &fakeSink{}, discardLogger(), nil)
+	if err := a.RunOnce(context.Background()); err == nil {
 		t.Fatal("RunOnce() error = nil, want error")
 	}
 	if len(st.setStateCalls) != 0 {
@@ -564,15 +452,44 @@ func TestRunOnce_UpsertFails_NoStateUpdate(t *testing.T) {
 }
 
 func TestRunOnce_WriteTabFails_NoStateUpdate(t *testing.T) {
-	zip := &model.ZipFile{FileID: "file-1", ModifiedTime: time.Now()}
-	src := &fakeSource{zip: zip}
-	rd := &fakeReader{recs: map[string][]model.Record{}}
+	src := &fakeSource{zip: &model.ZipFile{FileID: "file-1", ModifiedTime: time.Now()}}
 	st := newFakeStore()
 	sink := &fakeSink{err: errors.New("write boom")}
 
-	a := New(testConfig(), src, rd, st, sink, discardLogger(), nil)
-	err := a.RunOnce(context.Background())
-	if err == nil {
+	a := New(testKinds(), src, &fakeIngester{}, st, sink, discardLogger(), nil)
+	if err := a.RunOnce(context.Background()); err == nil {
+		t.Fatal("RunOnce() error = nil, want error")
+	}
+	if len(st.setStateCalls) != 0 {
+		t.Errorf("SetState calls = %d, want 0", len(st.setStateCalls))
+	}
+}
+
+func TestRunOnce_MovesDailySummaryFirstAfterWriting(t *testing.T) {
+	src := &fakeSource{zip: &model.ZipFile{FileID: "f1", ModifiedTime: time.Now()}}
+	sink := &fakeSink{}
+
+	a := New(testKinds(), src, &fakeIngester{}, newFakeStore(), sink, discardLogger(), nil)
+	if err := a.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce() error = %v", err)
+	}
+
+	if want := []string{report.DailySummaryTitle}; !slices.Equal(sink.moveTabCalls, want) {
+		t.Fatalf("MoveTabFirst calls = %v, want %v", sink.moveTabCalls, want)
+	}
+	// タブを作る前に移動しても意味がないため、書き込みの後でなければならない。
+	if len(sink.calls) == 0 {
+		t.Fatal("WriteTab が呼ばれていない")
+	}
+}
+
+func TestRunOnce_MoveTabFirstFails_NoStateUpdate(t *testing.T) {
+	src := &fakeSource{zip: &model.ZipFile{FileID: "f1", ModifiedTime: time.Now()}}
+	st := newFakeStore()
+	sink := &fakeSink{moveErr: errors.New("boom")}
+
+	a := New(testKinds(), src, &fakeIngester{}, st, sink, discardLogger(), nil)
+	if err := a.RunOnce(context.Background()); err == nil {
 		t.Fatal("RunOnce() error = nil, want error")
 	}
 	if len(st.setStateCalls) != 0 {
@@ -585,7 +502,7 @@ func TestRunOnce_WriteTabFails_NoStateUpdate(t *testing.T) {
 func TestRun_RunsOnceImmediately(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	src := &fakeSource{zip: nil}
-	a := New(testConfig(), src, &fakeReader{}, newFakeStore(), &fakeSink{}, discardLogger(), nil)
+	a := New(testKinds(), src, &fakeIngester{}, newFakeStore(), &fakeSink{}, discardLogger(), nil)
 
 	done := make(chan error, 1)
 	go func() { done <- a.Run(ctx, time.Hour) }()
@@ -599,7 +516,7 @@ func TestRun_RunsOnceImmediately(t *testing.T) {
 			t.Fatalf("Run() error = %v", err)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("Run did not return after ctx cancel")
+		t.Fatal("ctx キャンセル後に Run が返らない")
 	}
 
 	if len(src.calls) != 1 {
@@ -610,7 +527,7 @@ func TestRun_RunsOnceImmediately(t *testing.T) {
 func TestRun_ContinuesAfterRunOnceError(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	src := &fakeSource{err: errors.New("fetch boom")}
-	a := New(testConfig(), src, &fakeReader{}, newFakeStore(), &fakeSink{}, discardLogger(), nil)
+	a := New(testKinds(), src, &fakeIngester{}, newFakeStore(), &fakeSink{}, discardLogger(), nil)
 
 	done := make(chan error, 1)
 	go func() { done <- a.Run(ctx, 10*time.Millisecond) }()
@@ -624,7 +541,7 @@ func TestRun_ContinuesAfterRunOnceError(t *testing.T) {
 			t.Fatalf("Run() error = %v", err)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("Run did not return after ctx cancel")
+		t.Fatal("ctx キャンセル後に Run が返らない")
 	}
 
 	if len(src.calls) < 2 {
@@ -634,8 +551,7 @@ func TestRun_ContinuesAfterRunOnceError(t *testing.T) {
 
 func TestRun_ReturnsOnContextCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
-	src := &fakeSource{zip: nil}
-	a := New(testConfig(), src, &fakeReader{}, newFakeStore(), &fakeSink{}, discardLogger(), nil)
+	a := New(testKinds(), &fakeSource{zip: nil}, &fakeIngester{}, newFakeStore(), &fakeSink{}, discardLogger(), nil)
 
 	done := make(chan error, 1)
 	go func() { done <- a.Run(ctx, 10*time.Millisecond) }()
@@ -649,6 +565,6 @@ func TestRun_ReturnsOnContextCancel(t *testing.T) {
 			t.Fatalf("Run() error = %v", err)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("Run did not return after ctx cancel")
+		t.Fatal("ctx キャンセル後に Run が返らない")
 	}
 }

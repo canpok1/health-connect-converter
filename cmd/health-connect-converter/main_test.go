@@ -24,9 +24,6 @@ func TestParseOptions_Defaults(t *testing.T) {
 	if opt.DBPath != "/data/health.db" {
 		t.Errorf("DBPath = %q", opt.DBPath)
 	}
-	if opt.ConfigPath != "/app/config.yaml" {
-		t.Errorf("ConfigPath = %q", opt.ConfigPath)
-	}
 	if opt.LogLevel != "info" {
 		t.Errorf("LogLevel = %q", opt.LogLevel)
 	}
