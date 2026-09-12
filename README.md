@@ -41,7 +41,7 @@ docker compose pull
 docker compose up -d
 ```
 
-手動実行（初回のスキーマ調査・バックフィルなど）:
+手動実行（初回のスキーマ調査・バックフィルなど）。**`--once` は新着が無くても最新ZIPを取り込む**（[ADR 0010](docs/adr/0010-force-ingest-on-startup.md)）:
 
 ```bash
 docker compose run --rm health-connect-converter --once

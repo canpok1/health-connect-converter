@@ -13,3 +13,4 @@
 | [0007](0007-daily-summary-as-first-tab.md) | Claudeに読ませる正本としてdaily_summaryを先頭タブに固定する | 採用 | 2026-08-30 |
 | [0008](0008-replace-cumulative-records-per-day.md) | エクスポートに含まれる日は累積DBを日ごと置き換える | 採用 | 2026-09-03 |
 | [0009](0009-dedupe-by-health-connect-app-priority.md) | 日次集約をGo側で行い、アプリ優先度で重複排除する | 採用 | 2026-09-03 |
+| [0010](0010-force-ingest-on-startup.md) | 起動後の最初の1周は新着ZIPの有無によらず取り込む | 採用 | 2026-09-12 |
