@@ -58,6 +58,12 @@ type App struct {
 	sink   Sink
 	logger *slog.Logger
 	now    func() time.Time
+
+	// startupIngestDone はプロセス起動後の強制取り込みが済んだかを持つ。
+	// Watchtower はイメージ更新時にコンテナを作り直すため、起動は設定・コードの
+	// 変更とほぼ同義になる。最初の1周だけ新着判定を省いて取り込むことで、
+	// 変更検知の仕組みを足さずに「変えたら次の1周で反映される」を得る（ADR 0010）。
+	startupIngestDone bool
 }
 
 // New はAppを組み立てる。now が nil なら time.Now を使う。
@@ -76,14 +82,19 @@ func New(cfg *config.Config, src Source, rd Reader, st Store, sink Sink, logger 
 	}
 }
 
-// RunOnce は1周ぶんの処理をする。新着が無ければ取り込みは行わず、
-// daily_summary を先頭タブへ戻す是正だけを行う。
+// RunOnce は1周ぶんの処理をする。起動後の最初の1周は新着ZIPの有無によらず
+// 取り込む。以降は新着が無ければ取り込みを行わず、daily_summary を先頭タブへ
+// 戻す是正だけを行う。
 func (a *App) RunOnce(ctx context.Context) error {
 	started := time.Now()
 
 	after, err := a.lastProcessedModifiedTime(ctx)
 	if err != nil {
 		return err
+	}
+	if !a.startupIngestDone {
+		a.logger.Info("起動後の初回のため新着判定を省略", "last_processed", after)
+		after = time.Time{}
 	}
 
 	zip, err := a.src.FetchLatest(ctx, after)
@@ -143,6 +154,10 @@ func (a *App) RunOnce(ctx context.Context) error {
 	if err := a.updateState(ctx, zip, lastSuccess); err != nil {
 		return err
 	}
+
+	// 取り込みまで到達した周でだけ消化する。ZIPが取れなかった周で消化すると、
+	// 起動直後にDriveが落ちていたときに強制取り込みの機会を失う。
+	a.startupIngestDone = true
 
 	a.logger.Info("1周完了", "duration", time.Since(started))
 	return nil
@@ -217,7 +232,9 @@ func (a *App) writeMeta(ctx context.Context, lastSuccess, zipModified time.Time,
 
 func (a *App) updateState(ctx context.Context, zip *model.ZipFile, lastSuccess time.Time) error {
 	states := []struct{ key, value string }{
-		{stateKeyLastProcessedModifiedTime, zip.ModifiedTime.Format(time.RFC3339)},
+		// Drive の modifiedTime はミリ秒を持つ。RFC3339（秒精度）で保存すると
+		// 復元値が常に実際より古くなり、同じZIPが毎周回「新着」と判定される。
+		{stateKeyLastProcessedModifiedTime, zip.ModifiedTime.Format(time.RFC3339Nano)},
 		{stateKeyLastProcessedFileID, zip.FileID},
 		{stateKeyLastSuccessAt, lastSuccess.Format(time.RFC3339)},
 	}

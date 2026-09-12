@@ -20,12 +20,18 @@ type fakeSource struct {
 	zip   *model.ZipFile
 	err   error
 	calls []time.Time
+	// respectAfter が真なら、zip の modifiedTime が after より後のときだけ返す
+	// （drivesource と同じ判定）。強制取り込みの検証に使う。
+	respectAfter bool
 }
 
 func (f *fakeSource) FetchLatest(_ context.Context, after time.Time) (*model.ZipFile, error) {
 	f.calls = append(f.calls, after)
 	if f.err != nil {
 		return nil, f.err
+	}
+	if f.respectAfter && f.zip != nil && !f.zip.ModifiedTime.After(after) {
+		return nil, nil
 	}
 	return f.zip, nil
 }
@@ -293,23 +299,126 @@ func TestRunOnce_MoveTabFirstFails_NoStateUpdate(t *testing.T) {
 	}
 }
 
-func TestRunOnce_FetchLatestReceivesStateTime(t *testing.T) {
+func TestRunOnce_SecondCycle_FetchLatestReceivesStateTime(t *testing.T) {
 	want := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	zip := &model.ZipFile{FileID: "file-1", ModifiedTime: want}
 
-	src := &fakeSource{zip: nil}
+	src := &fakeSource{zip: zip}
 	st := newFakeStore()
-	st.state[stateKeyLastProcessedModifiedTime] = want.Format(time.RFC3339)
+
+	a := New(testConfig(), src, &fakeReader{}, st, &fakeSink{}, discardLogger(), nil)
+	// 1周目で起動後の強制取り込みを消化する。
+	if err := a.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce() 1周目 error = %v", err)
+	}
+	src.zip = nil
+	if err := a.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce() 2周目 error = %v", err)
+	}
+
+	if len(src.calls) != 2 {
+		t.Fatalf("FetchLatest calls = %d, want 2", len(src.calls))
+	}
+	if !src.calls[0].IsZero() {
+		t.Errorf("1周目の FetchLatest after = %v, want zero", src.calls[0])
+	}
+	if !src.calls[1].Equal(want) {
+		t.Errorf("2周目の FetchLatest after = %v, want %v", src.calls[1], want)
+	}
+}
+
+// TestRunOnce_FirstCycleIngestsEvenWithoutNewZip は、state が最新ZIPと同じ時刻でも
+// 起動後の最初の1周は取り込むことを確認する（ADR 0010）。config を変えた直後に
+// 反映されるのはこの経路。
+func TestRunOnce_FirstCycleIngestsEvenWithoutNewZip(t *testing.T) {
+	modified := time.Date(2026, 9, 11, 16, 30, 56, 853000000, time.UTC)
+	zip := &model.ZipFile{FileID: "file-1", ModifiedTime: modified, Data: []byte("dummy")}
+
+	src := &fakeSource{zip: zip, respectAfter: true}
+	rd := &fakeReader{recs: map[string][]model.Record{"steps": {{UUID: "a"}}}}
+	st := newFakeStore()
+	st.state[stateKeyLastProcessedModifiedTime] = modified.Format(time.RFC3339Nano)
+
+	a := New(testConfig(), src, rd, st, &fakeSink{}, discardLogger(), nil)
+	if err := a.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce() error = %v", err)
+	}
+
+	if rd.calls != 1 {
+		t.Fatalf("Read calls = %d, want 1（新着が無くても取り込む）", rd.calls)
+	}
+}
+
+// TestRunOnce_SecondCycleSkipsWhenNoNewZip は、強制取り込みが1周きりで、
+// 2周目以降は新着が無ければ取り込まないことを確認する。
+func TestRunOnce_SecondCycleSkipsWhenNoNewZip(t *testing.T) {
+	modified := time.Date(2026, 9, 11, 16, 30, 56, 853000000, time.UTC)
+	zip := &model.ZipFile{FileID: "file-1", ModifiedTime: modified, Data: []byte("dummy")}
+
+	src := &fakeSource{zip: zip, respectAfter: true}
+	rd := &fakeReader{recs: map[string][]model.Record{"steps": {{UUID: "a"}}}}
+	st := newFakeStore()
+
+	a := New(testConfig(), src, rd, st, &fakeSink{}, discardLogger(), nil)
+	for i := 1; i <= 2; i++ {
+		if err := a.RunOnce(context.Background()); err != nil {
+			t.Fatalf("RunOnce() %d周目 error = %v", i, err)
+		}
+	}
+
+	if rd.calls != 1 {
+		t.Errorf("Read calls = %d, want 1（2周目は新着なしで取り込まない）", rd.calls)
+	}
+}
+
+// TestRunOnce_StartupIngestRetriedAfterFailure は、強制取り込みの周が失敗したら
+// 次の周でも強制することを確認する。起動直後にDriveやSheetsが落ちていたときに
+// 取りこぼさないため。
+func TestRunOnce_StartupIngestRetriedAfterFailure(t *testing.T) {
+	modified := time.Date(2026, 9, 11, 16, 30, 56, 853000000, time.UTC)
+	zip := &model.ZipFile{FileID: "file-1", ModifiedTime: modified, Data: []byte("dummy")}
+
+	src := &fakeSource{zip: zip, respectAfter: true}
+	st := newFakeStore()
+	st.state[stateKeyLastProcessedModifiedTime] = modified.Format(time.RFC3339Nano)
+	sink := &fakeSink{err: errors.New("write boom")}
+
+	a := New(testConfig(), src, &fakeReader{}, st, sink, discardLogger(), nil)
+	if err := a.RunOnce(context.Background()); err == nil {
+		t.Fatal("RunOnce() 1周目 error = nil, want error")
+	}
+
+	sink.err = nil
+	if err := a.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce() 2周目 error = %v", err)
+	}
+
+	if len(src.calls) != 2 {
+		t.Fatalf("FetchLatest calls = %d, want 2", len(src.calls))
+	}
+	if !src.calls[1].IsZero() {
+		t.Errorf("2周目の FetchLatest after = %v, want zero（強制取り込みが未消化）", src.calls[1])
+	}
+}
+
+// TestRunOnce_StateKeepsMillisecondPrecision は state がミリ秒を落とさないことを
+// 確認する。秒精度で保存すると復元値が常に実際より古くなり、同じZIPが毎周回
+// 「新着」と判定される。
+func TestRunOnce_StateKeepsMillisecondPrecision(t *testing.T) {
+	modified := time.Date(2026, 9, 11, 16, 30, 56, 853000000, time.UTC)
+	zip := &model.ZipFile{FileID: "file-1", ModifiedTime: modified, Data: []byte("dummy")}
+
+	src := &fakeSource{zip: zip}
+	st := newFakeStore()
 
 	a := New(testConfig(), src, &fakeReader{}, st, &fakeSink{}, discardLogger(), nil)
 	if err := a.RunOnce(context.Background()); err != nil {
 		t.Fatalf("RunOnce() error = %v", err)
 	}
 
-	if len(src.calls) != 1 {
-		t.Fatalf("FetchLatest calls = %d, want 1", len(src.calls))
-	}
-	if !src.calls[0].Equal(want) {
-		t.Errorf("FetchLatest after = %v, want %v", src.calls[0], want)
+	const want = "2026-09-11T16:30:56.853Z"
+	if got := st.state[stateKeyLastProcessedModifiedTime]; got != want {
+		t.Errorf("last_processed_modified_time = %q, want %q", got, want)
 	}
 }
 
