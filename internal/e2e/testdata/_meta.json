@@ -112,6 +112,14 @@
   "2026-09-10 14:00:00Z"
  ],
  [
+  "sleep_stage_record_count",
+  5
+ ],
+ [
+  "sleep_stage_latest_record_at",
+  "2026-09-10 20:30:00Z"
+ ],
+ [
   "speed_record_count",
   2
  ],
@@ -210,6 +218,10 @@
  [
   "export_sleep_session_record_table_rows",
   1
+ ],
+ [
+  "export_sleep_stages_table_rows",
+  6
  ],
  [
   "export_speed_record_table_rows",

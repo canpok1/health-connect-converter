@@ -20,6 +20,7 @@ func All() []Kind {
 		respiratoryRateKind{},
 		restingHeartRateKind{},
 		sleepKind{},
+		sleepStageKind{},
 		speedKind{},
 		stepsKind{},
 		totalCaloriesBurnedKind{},

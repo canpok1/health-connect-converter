@@ -99,6 +99,11 @@ func newExportFixture(t *testing.T) string {
 	// 運動は種目（exercise_type）も持つ。保存はするが出力しない。
 	interval("exercise_session_record_table", "exercise_type")
 
+	// 睡眠ステージ（親は睡眠セッション）。
+	exec(`CREATE TABLE sleep_stages_table (
+		parent_key INTEGER NOT NULL, stage_start_time INTEGER NOT NULL,
+		stage_end_time INTEGER NOT NULL, stage_type INTEGER NOT NULL)`)
+
 	// 親子2表の種別。親は値列を持たない。
 	interval("heart_rate_record_table")
 	exec(`CREATE TABLE heart_rate_record_series_table (
@@ -175,6 +180,28 @@ func newExportFixture(t *testing.T) string {
 	intervalRow("SpeedRecordTable", "", jst(2026, 9, 11, 10, 0), jst(2026, 9, 11, 10, 30), 1)
 	exec(`INSERT INTO speed_record_table (parent_key, epoch_millis, speed) VALUES (1, ?, 0.3), (1, ?, 1.5)`,
 		jst(2026, 9, 11, 10, 0), jst(2026, 9, 11, 10, 30))
+
+	// 睡眠ステージ: 上の睡眠セッション（row_id=1、9/10 23:00〜9/11 06:30）の区間。
+	// 日付をまたぐが、すべて起床日（9/11）に数えるはず。合計は 450 分で
+	// セッションの長さと一致する。対応表に無い種別（2=睡眠）は落ちるはず。
+	stage := func(startH, startM, endH, endM, stageType int, nextDay bool) {
+		t.Helper()
+		startDay, endDay := 10, 10
+		if nextDay {
+			startDay, endDay = 11, 11
+		}
+		if startH > endH {
+			endDay = startDay + 1
+		}
+		exec(`INSERT INTO sleep_stages_table (parent_key, stage_start_time, stage_end_time, stage_type) VALUES (1, ?, ?, ?)`,
+			jst(2026, 9, startDay, startH, startM), jst(2026, 9, endDay, endH, endM), stageType)
+	}
+	stage(23, 0, 23, 30, 1, false) // 覚醒 30分
+	stage(23, 30, 2, 30, 4, false) // 浅い 180分（日付をまたぐ）
+	stage(2, 30, 3, 30, 5, true)   // 深い 60分
+	stage(3, 30, 5, 30, 4, true)   // 浅い 120分（合計 300分）
+	stage(5, 30, 6, 30, 6, true)   // REM 60分
+	stage(6, 30, 6, 30, 2, true)   // 対応表に無い種別（落ちるはず）
 
 	exec(`INSERT INTO mindfulness_session_record_table (row_id, v) VALUES (1, 1)`)
 

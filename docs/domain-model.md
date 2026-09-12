@@ -73,7 +73,7 @@
 | `respiratory_rate` | `respiratory_rate_record_table` | 瞬間 | `breaths_per_min←rate` | 測定時刻 | — | vitals | 全期間 | mean,count |
 | `resting_heart_rate` | `resting_heart_rate_record_table` | 瞬間 | `bpm←beats_per_minute` | 測定時刻 | — | vitals | 全期間 | mean,min,max,count |
 | `sleep` | `sleep_session_record_table` | 期間 | `duration_min`（期間から計算） | **終了（起床日）** | あり | sleep | 全期間 | sum,count |
-| `sleep_stage` | `sleep_session_record_table` + `sleep_stages_table` | 期間＋区間の種別 | `awake_min` / `light_min` / `deep_min` / `rem_min`（区間の長さを種別ごとに振り分け） | **親セッションの終了（起床日）** | — | — | 30日 | sum,count |
+| `sleep_stage` | `sleep_session_record_table` + `sleep_stages_table` | 期間＋区間の種別 | 区間の開始・終了・ステージ種別・**親セッションの終了時刻**。集計では長さを `awake_min` / `light_min` / `deep_min` / `rem_min` へ振り分ける | **親セッションの終了（起床日）** | — | — | 30日 | sum,count |
 | `speed` | `SpeedRecordTable` + `speed_record_table` | 期間＋連続測定 | `m_per_s←speed` | 測定時刻 | — | activity | 30日 | mean,max,count |
 | `steps` | `steps_record_table` | 期間 | `count←count` | 開始 | あり | activity | 30日 | sum |
 | `total_calories_burned` | `total_calories_burned_record_table` | 期間 | `kcal←energy ×0.001` | 開始 | あり | activity | 全期間 | sum |
@@ -81,6 +81,8 @@
 
 - **カテゴリ**は重複排除でアプリの優先度を引くときに使う（ヘルスコネクトの優先度はカテゴリ単位。[ADR 0009](adr/0009-dedupe-by-health-connect-app-priority.md)）。重複排除をしない種別には不要
 - `sleep_stage` の重複排除を「—」にしているのは、現状ステージを書くアプリが Fitbit だけで、全区間が同じ親に属するため既存の重なり判定と噛み合わないから（[ADR 0011](adr/0011-sleep-stage-with-own-times.md)）
+- **`sleep_stage` の生データタブだけ列の形が違う。** `local_date` / `local_start` / `local_end` / `app_id` / `stage`（awake / light / deep / rem）/ `minutes` で出す。ステージ種別ごとに4列へ散らすより、ひと晩の推移が読みやすいため。日次集計は種別ごとの列に分かれる
+- **`sleep_stage` の日ごと置き換えは親セッションの終了日で区切る。** 区間の開始日で区切ると、日付をまたぐひと晩が2日に割れる
 
 ## 単位
 
@@ -110,4 +112,6 @@
 
 ## 変えない約束
 
-**累積DBのテーブル名・列名・単位は現状のまま**にする。既存データをそのまま引き継ぎ、移行前後で出力が一致することを差分ゼロで確かめるため（新設する `sleep_stage` と、`exercise_session` に足す `exercise_type` は例外）。
+**累積DBのテーブル名・列名・単位は現状のまま**にする。テーブル名は `record_<種別キー>`。既存データをそのまま引き継ぎ、移行前後で出力が一致することを差分ゼロで確かめるため（新設した `sleep_stage` と、`exercise_session` に足した `exercise_type` は例外）。
+
+2026-09-12 の移行では、実物のエクスポート（16種別・約30万件）に対して移行前後の出力を突き合わせ、18タブすべてがバイト一致することを確認した。以降の変更でも、合成データの期待値テスト（`internal/e2e`）が出力の意図しない変化を落とす。
