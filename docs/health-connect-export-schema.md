@@ -73,7 +73,7 @@ device_data_provider_id
 - **`zone_offset` の単位は秒。** 生成列の定義 `time + 1000 * zone_offset` がミリ秒に揃えていることから確定。今回のデータは全件 `32400`（JST）
 - **`local_date` は epoch day**（1970-01-01 からの日数）。現地日が既に入っている。ただし series の子テーブルには無い
 - **`app_info_id` は `application_info_table.row_id` への外部キー。** アプリのパッケージ名は `application_info_table.package_name` を JOIN して得る（例: `com.google.android.apps.fitness`、`jp.co.omron.healthcare.omron_connect`）
-- **`sleep_stages_table` は 0 件。** スキーマ（`parent_key`, `stage_start_time`, `stage_end_time`, `stage_type`）は存在するがデータが無い。使用中の睡眠アプリがステージを書き出していない
+- **`sleep_stages_table` は 2026-08-28 時点で 0 件。** スキーマ（`parent_key`, `stage_start_time`, `stage_end_time`, `stage_type`）は存在するがデータが無かった。2026-09-12 のエクスポートでは Fitbit が書いている（後述の再調査を参照）
 - データの範囲は `local_date` で 19777〜20694（2024-02-24 〜 2026-08-28）の 918 日ぶん
 
 ## 値の単位
@@ -100,5 +100,24 @@ device_data_provider_id
 
 - `heart_rate_record_series_table` を心拍の `source_table` としていたが、これは**子テーブル**で `uuid` を持たない。親は `heart_rate_record_table`
 - レコードの共通列を `start_time` / `end_time` / `zone_offset` としていたが、instant 型は `time` / `zone_offset` の2列しか持たない。interval 型はオフセットを開始・終了で別々に持つ
-- 出力タブ案にある `sleep_deep_min` と `sleep_stages` は、`sleep_stages_table` が空のため出せない。睡眠はセッションの長さのみ扱う
+- 出力タブ案にある `sleep_deep_min` と `sleep_stages` は、`sleep_stages_table` が空のため出せなかった。睡眠はセッションの長さのみ扱っている（2026-09-12 の再調査で状況が変わった。後述）
 - 種別の値をそのまま出力できる前提だったが、体重（グラム）と消費エネルギー（カロリー）は単位変換が要る
+
+## 2026-09-12 の再調査（Fitbit 接続後）
+
+実物のエクスポート（`health_connect_export.db`、53MB、2026-09-11 取得）を同じ手段で読み直した。**2026-09-09 から Fitbit（`com.fitbit.FitbitMobile`）が書き始めており、上の調査時点で空だったテーブルにデータが入っている。**
+
+取り込み対象に追加したもの（どちらも instant 型・`category: vitals`・単位変換なし）。
+
+| テーブル | 値列 | 件数 | 期間 | 実測値 |
+|---|---|---|---|---|
+| `heart_rate_variability_rmssd_record_table` | `heart_rate_variability_millis` REAL | 178 | 2026-09-09〜09-11 | 11.2〜66.5 ms、平均 40.9。睡眠中のみ5分間隔（1日約86件）なので窓は `30d` |
+| `respiratory_rate_record_table` | `rate` REAL | 2 | 2026-09-10〜09-11 | 14.6 / 14.8 回/分。1日1件なので窓は `all` |
+
+データはあるが**取り込まなかった**もの。
+
+- **`exercise_segments_table`（243件、`exercise_session_record_table` の子）** — 全列が distinct = 1（`segment_type` は 24 のみ、`repetitions_count` は 0 のみ、`weight_grams` は全 NULL、`rate_of_perceived_exertion` は `session_rate_of_perceived_exertion` と同じ壊れ値 1.4e-45）。情報がゼロなので列を足す意味がない
+- **`sleep_stages_table`（138件、2セッション、Fitbit のみ）** — 覚醒/浅い/深い/REM の別に妥当な値が入っており（例: 2026-09-11 は 浅 299分・REM 92.5分・深 34分・覚醒 55.5分）、取り込む価値がある。ただし子テーブルの形が既存の series 型（`parent_key` + 値列 + `epoch_millis`）と違い（`stage_start_time` / `stage_end_time` / `stage_type`）、集計も「種別ごとの合計時間」になるため、`config.yaml` への追記だけでは足せない。**コード側に新しい類型を足す作業が要る**
+- 上記以外でデータを持つ未登録テーブルは、ヘルスコネクト自身の管理用（`activity_date_table` / `change_log_request_table` / `read_access_logs_table` / `preference_table` / `device_info_table` / `application_info_table` / `health_data_category_priority_table` / `device_data_sources_table` / `device_data_provider_metadata_table` / `android_metadata`）で、健康データではない
+
+`skin_temperature_record_table` や `vo2_max_record_table` など Fitbit が将来書きうるテーブルは現時点で 0 件。`_meta` タブの `export_<テーブル名>_rows` に全テーブルの行数が出るため、書き始めればそこで気付ける。
