@@ -299,3 +299,83 @@ func TestLocalDateExpr_PanicsOnBadColumn(t *testing.T) {
 	}()
 	_ = LocalDateExpr("start time", "zone_offset")
 }
+
+// TestMigrate_AddsTimeColumnBeforeIndex は、既存テーブルに無い列を TimeColumn と
+// して宣言したときでも移行が通ることを確認する。索引を列追加より先に作ると
+// 「まだ無い列」を参照して落ちる。
+func TestMigrate_AddsTimeColumnBeforeIndex(t *testing.T) {
+	db := newDB(t)
+	ctx := context.Background()
+
+	// 先に time_col を持たないテーブルを作る。
+	before := Table{
+		Name: "record_test",
+		Columns: []Column{
+			{Name: "uuid", Type: "TEXT"},
+			{Name: "zone_offset", Type: "INTEGER"},
+		},
+		TimeColumn: "zone_offset",
+		DateExpr:   LocalDateExpr("zone_offset", "zone_offset"),
+	}
+	if err := before.Migrate(ctx, db); err != nil {
+		t.Fatalf("Migrate（前）: %v", err)
+	}
+
+	// 新しく time_col を足し、それを TimeColumn にする。
+	after := Table{
+		Name: "record_test",
+		Columns: []Column{
+			{Name: "uuid", Type: "TEXT"},
+			{Name: "zone_offset", Type: "INTEGER"},
+			{Name: "time_col", Type: "INTEGER"},
+		},
+		TimeColumn: "time_col",
+		DateExpr:   LocalDateExpr("time_col", "zone_offset"),
+	}
+	if err := after.Migrate(ctx, db); err != nil {
+		t.Fatalf("Migrate（後）: %v", err)
+	}
+}
+
+// TestMigrate_DropsLegacyStartIndex は、設定ファイル駆動だった頃の索引
+// （idx_<テーブル>_start）を落とすことを確認する。同じ列に2本あっても速く
+// ならず、書き込みが遅くなるだけ。
+func TestMigrate_DropsLegacyStartIndex(t *testing.T) {
+	db := newDB(t)
+	ctx := context.Background()
+	tbl := testTable(Column{Name: "v", Type: "REAL"})
+
+	// 旧実装が作っていた形を再現する。
+	if _, err := db.ExecContext(ctx, `CREATE TABLE record_test (
+		uuid TEXT PRIMARY KEY, start_time INTEGER, end_time INTEGER,
+		zone_offset INTEGER, app_id TEXT, v REAL)`); err != nil {
+		t.Fatalf("旧テーブル作成: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `CREATE INDEX idx_record_test_start ON record_test(start_time)`); err != nil {
+		t.Fatalf("旧索引作成: %v", err)
+	}
+
+	if err := tbl.Migrate(ctx, db); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+
+	indexes := map[string]bool{}
+	rows, err := db.QueryContext(ctx, `SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'record_test'`)
+	if err != nil {
+		t.Fatalf("索引の一覧: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		indexes[name] = true
+	}
+	if indexes["idx_record_test_start"] {
+		t.Error("旧索引 idx_record_test_start が残っている")
+	}
+	if !indexes["idx_record_test_start_time"] {
+		t.Errorf("新しい索引が無い: %v", indexes)
+	}
+}

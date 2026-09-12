@@ -84,7 +84,8 @@ func TestAll_TablesAndPoliciesAreValid(t *testing.T) {
 			t.Errorf("%s: dedupe を使うのにカテゴリが未指定", k.Key())
 		}
 
-		// 値名は辞書順・重複なしで、生データのヘッダにも現れること。
+		// 値名は辞書順で重複が無いこと。重複すると daily_summary に同名の列が
+		// 2本出る。
 		names := k.ValueNames()
 		if len(names) == 0 {
 			t.Errorf("%s: 値名が空", k.Key())
@@ -92,9 +93,26 @@ func TestAll_TablesAndPoliciesAreValid(t *testing.T) {
 		if !sort.StringsAreSorted(names) {
 			t.Errorf("%s: 値名が辞書順でない: %v", k.Key(), names)
 		}
+		seenName := map[string]bool{}
+		for _, n := range names {
+			if seenName[n] {
+				t.Errorf("%s: 値名が重複している: %v", k.Key(), names)
+			}
+			seenName[n] = true
+		}
+
+		// 生データのヘッダは先頭4列（local_date / local_start / local_end / app_id）に
+		// 続けて種別ごとの列を持つこと。値名と一致するかは種別による（睡眠ステージは
+		// stage と minutes の2列で出す）。
 		header := k.RawHeader()
-		if len(header) < 4 {
+		if len(header) < 5 {
 			t.Errorf("%s: 生データのヘッダが短い: %v", k.Key(), header)
+		}
+		wantHead := []any{"local_date", "local_start", "local_end", "app_id"}
+		for i, want := range wantHead {
+			if header[i] != want {
+				t.Errorf("%s: 生データのヘッダ %d列目 = %v, want %v", k.Key(), i+1, header[i], want)
+			}
 		}
 	}
 }

@@ -108,11 +108,6 @@ func (t Table) Migrate(ctx context.Context, db *sql.DB) error {
 		return fmt.Errorf("cumdb: create table %s: %w", t.Name, err)
 	}
 
-	idx := fmt.Sprintf("CREATE INDEX IF NOT EXISTS idx_%s_time ON %s(%s)", t.Name, t.Name, t.TimeColumn)
-	if _, err := db.ExecContext(ctx, idx); err != nil {
-		return fmt.Errorf("cumdb: create index on %s: %w", t.Name, err)
-	}
-
 	existing, err := t.existingColumns(ctx, db)
 	if err != nil {
 		return err
@@ -126,7 +121,31 @@ func (t Table) Migrate(ctx context.Context, db *sql.DB) error {
 			return fmt.Errorf("cumdb: add column %s to %s: %w", c.Name, t.Name, err)
 		}
 	}
+
+	// 索引は列を追加した後に作る。既存のテーブルに無い列を TimeColumn として
+	// 宣言した場合、先に索引を作ると「まだ無い列」を参照して移行が止まる。
+	idx := fmt.Sprintf("CREATE INDEX IF NOT EXISTS %s ON %s(%s)", t.indexName(), t.Name, t.TimeColumn)
+	if _, err := db.ExecContext(ctx, idx); err != nil {
+		return fmt.Errorf("cumdb: create index on %s: %w", t.Name, err)
+	}
+
+	// 設定ファイル駆動だった頃は idx_<テーブル>_start という名前で start_time に
+	// 索引を張っていた。同じ列に2本あっても速くならず書き込みが遅くなるだけなので、
+	// 既存のデータベースから落とす。TimeColumn が start_time のときだけ行う
+	// （別の列を見る種別では、旧索引が現役の可能性がある）。
+	if t.TimeColumn == "start_time" {
+		legacy := fmt.Sprintf("DROP INDEX IF EXISTS idx_%s_start", t.Name)
+		if _, err := db.ExecContext(ctx, legacy); err != nil {
+			return fmt.Errorf("cumdb: drop legacy index on %s: %w", t.Name, err)
+		}
+	}
 	return nil
+}
+
+// indexName は TimeColumn 用の索引名。列名から作るため、時刻列を変えた種別で
+// 名前が衝突しない。
+func (t Table) indexName() string {
+	return fmt.Sprintf("idx_%s_%s", t.Name, t.TimeColumn)
 }
 
 func (t Table) existingColumns(ctx context.Context, db *sql.DB) (map[string]bool, error) {
@@ -244,7 +263,11 @@ func (t Table) Query(ctx context.Context, db *sql.DB, sinceMs int64) (*sql.Rows,
 	return rows, nil
 }
 
-// Stats は件数と最新レコードの時刻を返す。テーブルが無ければゼロ値を返す。
+// Stats は件数と最新レコードの時刻を返す。
+//
+// テーブルが無い場合はエラーになる。取り込み前に Migrate が全種別ぶんのテーブルを
+// 作るため、無いのは実装か運用の誤りであり、黙ってゼロ件として出すより気付ける
+// ほうがよい。
 func (t Table) Stats(ctx context.Context, db *sql.DB) (model.TypeStats, error) {
 	if err := t.validate(); err != nil {
 		return model.TypeStats{}, err
