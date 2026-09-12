@@ -100,6 +100,28 @@ types:
     window: all
     daily: [mean, min, max, count]
 
+  heart_rate_variability:
+    source_table: heart_rate_variability_rmssd_record_table
+    time_layout: instant
+    columns:
+      rmssd_ms:
+        column: heart_rate_variability_millis
+    category: vitals
+    # Fitbit が睡眠中に5分間隔で書くため1日約86件。血圧のような数件/日とは
+    # 桁が違うので、生データは直近30日に絞る。
+    window: 30d
+    daily: [mean, min, max, count]
+
+  respiratory_rate:
+    source_table: respiratory_rate_record_table
+    time_layout: instant
+    columns:
+      breaths_per_min:
+        column: rate
+    category: vitals
+    window: all
+    daily: [mean, count]
+
   oxygen_saturation:
     source_table: oxygen_saturation_record_table
     time_layout: instant
