@@ -1,0 +1,23 @@
+[
+ [
+  "local_date",
+  "local_start",
+  "local_end",
+  "app_id",
+  "kg"
+ ],
+ [
+  "2026-09-10",
+  "2026-09-10 07:00:00",
+  "2026-09-10 07:00:00",
+  "jp.co.omron.healthcare.omron_connect",
+  64.6
+ ],
+ [
+  "2026-09-11",
+  "2026-09-11 07:00:00",
+  "2026-09-11 07:00:00",
+  "jp.co.omron.healthcare.omron_connect",
+  64
+ ]
+]

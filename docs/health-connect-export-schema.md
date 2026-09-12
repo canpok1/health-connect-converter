@@ -4,9 +4,9 @@
 
 調査に使った手段: `modernc.org/sqlite` で読み取り専用に開き、`sqlite_master` と各テーブルのサンプル行を出力した。
 
-## テーブルの3類型
+## テーブルの類型
 
-レコード種別のテーブルは、時刻の持ち方で3つに分かれる。**種別ごとに列名が違うのではなく、この3類型のどれかに必ず当てはまる。** 設定ファイルにはこの類型（`time_layout`）を書き、時刻列名そのものは書かない。
+レコード種別のテーブルは、時刻の持ち方で分かれる。2026-08-28 の調査では3類型（instant / interval / series）だったが、睡眠ステージの取り込みで **segment**（親の期間＋子の区間と種別）を足した。**種別ごとに列名が違うのではなく、この類型のどれかに当てはまる。** 読み出しの定型処理は類型ごとに共通部品として持ち（`internal/hcsql`）、時刻列名は種別ごとのコードが指定する。
 
 ### instant — 瞬時値
 
@@ -117,7 +117,7 @@ device_data_provider_id
 データはあるが**取り込まなかった**もの。
 
 - **`exercise_segments_table`（243件、`exercise_session_record_table` の子）** — 全列が distinct = 1（`segment_type` は 24 のみ、`repetitions_count` は 0 のみ、`weight_grams` は全 NULL、`rate_of_perceived_exertion` は `session_rate_of_perceived_exertion` と同じ壊れ値 1.4e-45）。情報がゼロなので列を足す意味がない
-- **`sleep_stages_table`（138件、2セッション、Fitbit のみ）** — 覚醒/浅い/深い/REM の別に妥当な値が入っており（例: 2026-09-11 は 浅 299分・REM 92.5分・深 34分・覚醒 55.5分）、取り込む価値がある。ただし子テーブルの形が既存の series 型（`parent_key` + 値列 + `epoch_millis`）と違い（`stage_start_time` / `stage_end_time` / `stage_type`）、集計も「種別ごとの合計時間」になるため、`config.yaml` への追記だけでは足せない。**コード側に新しい類型を足す作業が要る**
+- ~~**`sleep_stages_table`（138件、2セッション、Fitbit のみ）**~~ → **2026-09-12 に `sleep_stage` 種別として取り込んだ**（[ADR 0011](adr/0011-sleep-stage-with-own-times.md)）。子テーブルの形が既存の series 型（`parent_key` + 値列 + `epoch_millis`）と違い（`stage_start_time` / `stage_end_time` / `stage_type`）、集計も「種別ごとの合計時間」になるため、読み出しに segment 型を足した。実測は 2026-09-10 が 覚醒21.5 / 浅い261.5 / 深い31.5 / REM106.5 分、2026-09-11 が 覚醒55.5 / 浅い299 / 深い34 / REM92.5 分で、どちらも合計が睡眠時間と一致する
 - 上記以外でデータを持つ未登録テーブルは、ヘルスコネクト自身の管理用（`activity_date_table` / `change_log_request_table` / `read_access_logs_table` / `preference_table` / `device_info_table` / `application_info_table` / `health_data_category_priority_table` / `device_data_sources_table` / `device_data_provider_metadata_table` / `android_metadata`）で、健康データではない
 
 `skin_temperature_record_table` や `vo2_max_record_table` など Fitbit が将来書きうるテーブルは現時点で 0 件。`_meta` タブの `export_<テーブル名>_rows` に全テーブルの行数が出るため、書き始めればそこで気付ける。

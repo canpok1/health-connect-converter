@@ -99,17 +99,22 @@ SQLite ドライバは **`modernc.org/sqlite`（純Go実装）** を使う。cgo
 | パッケージ | 責務 | 依存 |
 |---|---|---|
 | `internal/drivesource` | ZIP 取得。新着がなければ「なし」を返す | Drive API |
-| `internal/hcreader` | エクスポート DB → 正規化レコード列。種別マッピングは宣言的設定から読む | `database/sql` のみ |
-| `internal/store` | 累積 SQLite。UPSERT・期間クエリ・日次集約 | `database/sql` のみ |
+| `internal/hcreader` | ZIP の展開とエクスポート DB の open、アプリ優先度・全テーブル行数の読み出し | `database/sql` のみ |
+| `internal/hcsql` | エクスポート DB 読み出しの定型（instant / interval / series / segment） | `database/sql` のみ |
+| `internal/kind` | 種別ごとの保存用モデルと読み出し・変換・出力・方針。1種別1ファイル | `database/sql` のみ |
+| `internal/agg` | 重複排除と日次集計（集計用モデルだけを見る） | なし |
+| `internal/cumdb` | 累積 SQLite のテーブル操作の定型 | `database/sql` のみ |
+| `internal/ingest` | ZIP 展開から取り込みまでの組み立て | `database/sql` のみ |
+| `internal/store` | 累積 SQLite の開閉・state・アプリ優先度・種別ごとの取り込みと問い合わせ | `database/sql` のみ |
 | `internal/sheetssink` | タブ書き込み。無ければ `addSheet`、あれば `clear` + `update` | Sheets API |
 
-`cmd/health-connect-converter` はこの4つを繋ぎ、`time.Ticker` でポーリングループを回すだけ。`--once` フラグで1回だけ実行して終了する。
+`cmd/health-connect-converter` はこれらを繋ぎ、`time.Ticker` でポーリングループを回すだけ。`--once` フラグで1回だけ実行して終了する。
 
 外部 API に触る2つはインターフェースで抽象化し、テストではフェイク実装を挿す。
 
 ## データモデル（累積 SQLite）
 
-種別ごとにテーブルを分ける（列が異なるため）。共通列を揃える。
+種別ごとにテーブルを分ける（列が異なるため）。テーブル名は `record_<種別キー>`。多くの種別は次の列を共通で持つが、**列の構成は種別ごとの宣言が決める**（睡眠ステージは親セッションの終了時刻とステージ種別を持つ）。
 
 | 列 | 内容 |
 |---|---|
@@ -135,48 +140,25 @@ UPSERT は `INSERT ... ON CONFLICT(uuid) DO UPDATE`。トランザクション�
 
 **`daily_summary` は常に先頭タブに置く。** Drive コネクタにはタブ単位で読む手段が無く、スプレッドシート全体は読み取り上限を超える。一方 Drive の `text/csv` エクスポートは先頭タブだけを返すため、ここに `daily_summary` を置くことが「Claude が1回で全期間を読める」唯一の経路になる。タブ順は表示上の都合ではなく仕様であり、並べ替えは破壊的変更にあたる。人手でシートを先頭へ挿入されても戻せるよう、毎周回で無条件に是正する（[ADR 0007](../adr/0007-daily-summary-as-first-tab.md)）。
 
-## 設定ファイル
+## 種別の追加
 
-種別の追加はエントリ1つ。コード変更は不要。
+**種別ごとに1ファイル。** 保存用モデル・エクスポートDBからの読み出し・集計用モデルへの変換・生データの行の作り方・方針（生データの窓・日次関数・重複排除）をその種別のファイルに書き、一覧へ1行足す。層の分け方と種別ごとの実体は [docs/domain-model.md](../domain-model.md) を参照する。
 
-**列を追加する前に、エクスポート DB で実データの分布（distinct 値・件数・値域）を確認する。** `config.yaml` は書いた列をそのまま出力へ流す設計（[ADR 0004](../adr/0004-config-driven-generic-records.md)）で、エクスポート元の値が壊れていても検証しないため、壊れた列をそのまま追加してしまう（`session_rate_of_perceived_exertion` の異常値がその実例。distinct = 1 を見た時点で気付けた）。
+当初は「種別の追加はエントリ1つ。コード変更は不要」を要件に挙げ、設定ファイル（`config.yaml`）で表していた。2026-09-12 に**この要件を捨てた**（[ADR 0012](../adr/0012-split-measured-data-from-aggregation-model.md)）。汎用レコードが「実測データの表現」と「集計処理の入力」を兼ねていたため、集計の都合が保存の形へ漏れていた。
 
-```yaml
-types:
-  blood_pressure:
-    source_table: blood_pressure_record_table
-    window: all
-    daily: [mean, count]
-  heart_rate:
-    source_table: heart_rate_record_series_table
-    window: 30d
-    daily: [mean, min, max]
-```
-
-対象は バイタル（血圧・心拍・安静時心拍・SpO2・体温・HRV）／睡眠／活動（歩数・距離・消費カロリー・運動セッション）／身体測定（体重・体脂肪率）の4群、10〜15種別程度。
+**列を追加する前に、エクスポート DB で実データの分布（distinct 値・件数・値域）を確認する。** 読んだ値をそのまま出力へ流すため、エクスポート元の値が壊れていても気付けない（`session_rate_of_perceived_exertion` の異常値がその実例。distinct = 1 を見た時点で気付けた）。取り込まないと決めた列とその根拠は domain-model.md に残す。
 
 ### 多重計上を防ぐ設定
 
-**同じ実測を複数のアプリが書いている種別では `dedupe: true` を指定する。** 指定しないと単純な合計になり、アプリの数だけ多重計上される（歩数を3アプリが書いていて3倍になった実例がある）。判定材料は生データタブの `app_id` 列で、1日を複数のアプリが埋めていれば対象。
+**同じ実測を複数のアプリが書いている種別では、方針で重複排除を有効にする。** 指定しないと単純な合計になり、アプリの数だけ多重計上される（歩数を3アプリが書いていて3倍になった実例がある）。判定材料は生データタブの `app_id` 列で、1日を複数のアプリが埋めていれば対象。
 
-```yaml
-  steps:
-    source_table: steps_record_table
-    category: activity   # dedupe を使うなら必須
-    dedupe: true
-    window: 30d
-    daily: [sum]
-```
-
-- `category` は Health Connect のデータカテゴリ名（`activity` / `body_measurements` / `cycle_tracking` / `nutrition` / `sleep` / `vitals` / `wellness`）。**どのアプリを優先するかは端末の Health Connect 設定（データソースと優先度）が持っており、エクスポート DB の `health_data_category_priority_table` から読む。** 優先度はカテゴリ単位のため、種別がどのカテゴリに属するかを設定に書く必要がある
+- **どのアプリを優先するかは端末の Health Connect 設定（データソースと優先度）が持っており、エクスポート DB の `health_data_category_priority_table` から読む。** 優先度はカテゴリ単位のため、種別がどのカテゴリに属するかを方針に書く必要がある
 - 採用の単位は「アプリ × 現地日」。優先度の高いアプリがその日に記録していた時間帯は、下位アプリのぶんを数えない。上位アプリが記録していない時間帯（例: 途中から使い始めた日）は下位アプリで埋まる
 - **優先度が読めないエクスポート（テーブルが無い等）では重複排除を行わない。** 消してしまうより多いまま出す方が気付ける
 
 ### 日をまたぐレコードの日付
 
-`date_basis: end` を指定すると、レコードを終了時刻の日で数える。既定は `start`。**日付が変わってから寝た日に前夜ぶんと当夜ぶんが合算される**ため、睡眠は `end`（起床日）にしている。
-
-`config.yaml` は本リポジトリにコミットしイメージへ同梱する（デプロイ先はmini-pc 1台のみで、環境ごとに切り替える想定がないため。経緯は [ADR 0002](../adr/0002-bundle-config-into-image.md)）。
+どの日に数えるかは種別ごとの変換が決める。睡眠は**起床日**（終了時刻の日）に寄せる。日付が変わってから寝た日に前夜ぶんと当夜ぶんが合算されるのを防ぐため。睡眠ステージも同じ夜に揃えるため、親セッションの終了時刻から決める（[ADR 0011](../adr/0011-sleep-stage-with-own-times.md)）。
 
 ## 配備：Docker Compose
 

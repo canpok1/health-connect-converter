@@ -3,8 +3,8 @@ package hcreader
 import (
 	"archive/zip"
 	"bytes"
+	"context"
 	"database/sql"
-	"encoding/hex"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -13,386 +13,20 @@ import (
 	"testing"
 
 	_ "modernc.org/sqlite"
-
-	"health-connect-converter/internal/config"
-	"health-connect-converter/internal/model"
 )
 
 // --- フィクスチャ ---
 
-const (
-	parentUUIDHex = "0123456789abcdef0123456789abcdef"
-	otherUUIDHex  = "fedcba9876543210fedcba9876543210"
-)
-
-func mustDecodeHex(t *testing.T, s string) []byte {
+// mustOpen はエクスポートDBを開く（テスト終了時に閉じる）。
+func mustOpen(t *testing.T, path string) *sql.DB {
 	t.Helper()
-	b, err := hex.DecodeString(s)
+	db, err := Open(path)
 	if err != nil {
-		t.Fatalf("decode hex %q: %v", s, err)
+		t.Fatalf("Open(%s): %v", path, err)
 	}
-	return b
+	t.Cleanup(func() { _ = db.Close() })
+	return db
 }
-
-// newFixtureDB は instant/interval/series の各1テーブルと application_info_table を
-// 持つ、エクスポートDB相当のSQLiteファイルを作る。
-func newFixtureDB(t *testing.T) string {
-	t.Helper()
-	path := filepath.Join(t.TempDir(), "fixture.db")
-
-	db, err := sql.Open("sqlite", path)
-	if err != nil {
-		t.Fatalf("open fixture db: %v", err)
-	}
-	defer func() { _ = db.Close() }()
-
-	ddl := []string{
-		`CREATE TABLE application_info_table (row_id INTEGER PRIMARY KEY, package_name TEXT)`,
-		`CREATE TABLE hc_instant (
-			uuid BLOB, time INTEGER, zone_offset INTEGER, app_info_id INTEGER,
-			value_a REAL, value_b REAL
-		)`,
-		`CREATE TABLE hc_interval (
-			uuid BLOB, start_time INTEGER, start_zone_offset INTEGER,
-			end_time INTEGER, end_zone_offset INTEGER, app_info_id INTEGER, count INTEGER
-		)`,
-		`CREATE TABLE hc_series_parent (
-			uuid BLOB, start_time INTEGER, start_zone_offset INTEGER,
-			end_time INTEGER, end_zone_offset INTEGER, app_info_id INTEGER,
-			row_id INTEGER PRIMARY KEY
-		)`,
-		`CREATE TABLE hc_series_child (
-			parent_key INTEGER, epoch_millis INTEGER, beats_per_minute INTEGER
-		)`,
-		// エクスポートDBが series の親テーブルの一部を CamelCase で命名すること
-		// （例: SpeedRecordTable）を再現するフィクスチャ。
-		`CREATE TABLE CamelSeriesParent (
-			uuid BLOB, start_time INTEGER, start_zone_offset INTEGER,
-			end_time INTEGER, end_zone_offset INTEGER, app_info_id INTEGER,
-			row_id INTEGER PRIMARY KEY
-		)`,
-		`CREATE TABLE camel_series_child (
-			parent_key INTEGER, epoch_millis INTEGER, speed REAL
-		)`,
-	}
-	for _, stmt := range ddl {
-		if _, err := db.Exec(stmt); err != nil {
-			t.Fatalf("exec ddl %q: %v", stmt, err)
-		}
-	}
-
-	exec := func(query string, args ...any) {
-		t.Helper()
-		if _, err := db.Exec(query, args...); err != nil {
-			t.Fatalf("exec %q: %v", query, err)
-		}
-	}
-
-	exec(`INSERT INTO application_info_table (row_id, package_name) VALUES (1, 'com.example.app')`)
-
-	// instant: app_info_id あり・値NULL無しの行と、app_info_id NULL・value_b NULLの行。
-	exec(`INSERT INTO hc_instant (uuid, time, zone_offset, app_info_id, value_a, value_b)
-		VALUES (?, 1000, 32400, 1, 42, 64000)`, mustDecodeHex(t, parentUUIDHex))
-	exec(`INSERT INTO hc_instant (uuid, time, zone_offset, app_info_id, value_a, value_b)
-		VALUES (?, 2000, 32400, NULL, 7, NULL)`, mustDecodeHex(t, otherUUIDHex))
-
-	// interval: end_zone_offset はレコードに使われないことを end_zone_offset != start_zone_offset で確認する。
-	exec(`INSERT INTO hc_interval (uuid, start_time, start_zone_offset, end_time, end_zone_offset, app_info_id, count)
-		VALUES (?, 1000, 32400, 2000, 99999, 1, 5)`, mustDecodeHex(t, parentUUIDHex))
-
-	// series: 親1件、子3件。
-	exec(`INSERT INTO hc_series_parent (uuid, start_time, start_zone_offset, end_time, end_zone_offset, app_info_id, row_id)
-		VALUES (?, 1000, 32400, 4000, 32400, 1, 1)`, mustDecodeHex(t, parentUUIDHex))
-	exec(`INSERT INTO hc_series_child (parent_key, epoch_millis, beats_per_minute) VALUES (1, 1000, 60)`)
-	exec(`INSERT INTO hc_series_child (parent_key, epoch_millis, beats_per_minute) VALUES (1, 2000, 65)`)
-	exec(`INSERT INTO hc_series_child (parent_key, epoch_millis, beats_per_minute) VALUES (1, 3000, 70)`)
-
-	exec(`INSERT INTO CamelSeriesParent (uuid, start_time, start_zone_offset, end_time, end_zone_offset, app_info_id, row_id)
-		VALUES (?, 1000, 32400, 4000, 32400, 1, 1)`, mustDecodeHex(t, parentUUIDHex))
-	exec(`INSERT INTO camel_series_child (parent_key, epoch_millis, speed) VALUES (1, 1000, 1.5)`)
-
-	return path
-}
-
-func instantTypeConfig() config.TypeConfig {
-	return config.TypeConfig{
-		SourceTable: "hc_instant",
-		TimeLayout:  config.LayoutInstant,
-		Columns: map[string]config.ColumnConfig{
-			"val_a": {Column: "value_a", Scale: 1},
-			"val_b": {Column: "value_b", Scale: 0.001},
-		},
-	}
-}
-
-func intervalTypeConfig() config.TypeConfig {
-	return config.TypeConfig{
-		SourceTable: "hc_interval",
-		TimeLayout:  config.LayoutInterval,
-		Columns: map[string]config.ColumnConfig{
-			"count": {Column: "count", Scale: 1},
-		},
-	}
-}
-
-func seriesTypeConfig() config.TypeConfig {
-	return config.TypeConfig{
-		SourceTable: "hc_series_parent",
-		TimeLayout:  config.LayoutSeries,
-		SeriesTable: "hc_series_child",
-		Columns: map[string]config.ColumnConfig{
-			"bpm": {Column: "beats_per_minute", Scale: 1},
-		},
-	}
-}
-
-func camelSeriesTypeConfig() config.TypeConfig {
-	return config.TypeConfig{
-		SourceTable: "CamelSeriesParent",
-		TimeLayout:  config.LayoutSeries,
-		SeriesTable: "camel_series_child",
-		Columns: map[string]config.ColumnConfig{
-			"speed": {Column: "speed", Scale: 1},
-		},
-	}
-}
-
-// --- ReadDB: instant ---
-
-func TestReadDB_Instant(t *testing.T) {
-	dbPath := newFixtureDB(t)
-	cfg := &config.Config{Types: map[string]config.TypeConfig{"instant_type": instantTypeConfig()}}
-
-	got, err := ReadDB(dbPath, cfg, nil)
-	if err != nil {
-		t.Fatalf("ReadDB: %v", err)
-	}
-
-	recs := got.Records["instant_type"]
-	if len(recs) != 2 {
-		t.Fatalf("expected 2 records, got %d", len(recs))
-	}
-
-	byUUID := make(map[string]int)
-	for i, r := range recs {
-		byUUID[r.UUID] = i
-	}
-
-	r0 := recs[byUUID[parentUUIDHex]]
-	if r0.UUID != parentUUIDHex {
-		t.Errorf("uuid = %q, want %q", r0.UUID, parentUUIDHex)
-	}
-	if r0.StartTime != 1000 || r0.EndTime != 1000 {
-		t.Errorf("StartTime/EndTime = %d/%d, want 1000/1000", r0.StartTime, r0.EndTime)
-	}
-	if r0.ZoneOffset != 32400 {
-		t.Errorf("ZoneOffset = %d, want 32400", r0.ZoneOffset)
-	}
-	if r0.AppID != "com.example.app" {
-		t.Errorf("AppID = %q, want com.example.app", r0.AppID)
-	}
-	if got, want := r0.Values["val_a"], 42.0; got != want {
-		t.Errorf("val_a = %v, want %v", got, want)
-	}
-	if got, want := r0.Values["val_b"], 64.0; got != want {
-		t.Errorf("val_b (scaled) = %v, want %v", got, want)
-	}
-
-	r1 := recs[byUUID[otherUUIDHex]]
-	if r1.AppID != "" {
-		t.Errorf("AppID for NULL app_info_id = %q, want empty", r1.AppID)
-	}
-	if _, ok := r1.Values["val_b"]; ok {
-		t.Errorf("val_b should be absent for NULL column, got %v", r1.Values["val_b"])
-	}
-}
-
-func TestReadDB_Instant_UUIDIsLowerHex32(t *testing.T) {
-	dbPath := newFixtureDB(t)
-	cfg := &config.Config{Types: map[string]config.TypeConfig{"instant_type": instantTypeConfig()}}
-
-	got, err := ReadDB(dbPath, cfg, nil)
-	if err != nil {
-		t.Fatalf("ReadDB: %v", err)
-	}
-	for _, r := range got.Records["instant_type"] {
-		if len(r.UUID) != 32 {
-			t.Errorf("uuid length = %d, want 32 (uuid=%q)", len(r.UUID), r.UUID)
-		}
-		for _, c := range r.UUID {
-			if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
-				t.Errorf("uuid %q contains non lower-hex char %q", r.UUID, c)
-			}
-		}
-	}
-}
-
-// --- ReadDB: interval ---
-
-func TestReadDB_Interval(t *testing.T) {
-	dbPath := newFixtureDB(t)
-	cfg := &config.Config{Types: map[string]config.TypeConfig{"interval_type": intervalTypeConfig()}}
-
-	got, err := ReadDB(dbPath, cfg, nil)
-	if err != nil {
-		t.Fatalf("ReadDB: %v", err)
-	}
-
-	recs := got.Records["interval_type"]
-	if len(recs) != 1 {
-		t.Fatalf("expected 1 record, got %d", len(recs))
-	}
-	r := recs[0]
-	if r.StartTime != 1000 {
-		t.Errorf("StartTime = %d, want 1000", r.StartTime)
-	}
-	if r.EndTime != 2000 {
-		t.Errorf("EndTime = %d, want 2000", r.EndTime)
-	}
-	if r.ZoneOffset != 32400 {
-		t.Errorf("ZoneOffset = %d, want 32400 (start_zone_offset, not end_zone_offset)", r.ZoneOffset)
-	}
-	if got, want := r.Values["count"], 5.0; got != want {
-		t.Errorf("count = %v, want %v", got, want)
-	}
-}
-
-// --- ReadDB: series ---
-
-func TestReadDB_Series(t *testing.T) {
-	dbPath := newFixtureDB(t)
-	cfg := &config.Config{Types: map[string]config.TypeConfig{"series_type": seriesTypeConfig()}}
-
-	got, err := ReadDB(dbPath, cfg, nil)
-	if err != nil {
-		t.Fatalf("ReadDB: %v", err)
-	}
-
-	recs := got.Records["series_type"]
-	if len(recs) != 3 {
-		t.Fatalf("expected 3 records, got %d", len(recs))
-	}
-
-	wantUUIDs := map[string]struct {
-		epochMillis int64
-		bpm         float64
-	}{
-		parentUUIDHex + "#1000": {1000, 60},
-		parentUUIDHex + "#2000": {2000, 65},
-		parentUUIDHex + "#3000": {3000, 70},
-	}
-
-	seen := make(map[string]bool)
-	for _, r := range recs {
-		if seen[r.UUID] {
-			t.Errorf("duplicate uuid %q", r.UUID)
-		}
-		seen[r.UUID] = true
-
-		want, ok := wantUUIDs[r.UUID]
-		if !ok {
-			t.Fatalf("unexpected uuid %q", r.UUID)
-		}
-		if r.StartTime != want.epochMillis || r.EndTime != want.epochMillis {
-			t.Errorf("uuid %q: StartTime/EndTime = %d/%d, want %d/%d", r.UUID, r.StartTime, r.EndTime, want.epochMillis, want.epochMillis)
-		}
-		if r.ZoneOffset != 32400 {
-			t.Errorf("uuid %q: ZoneOffset = %d, want 32400", r.UUID, r.ZoneOffset)
-		}
-		if r.AppID != "com.example.app" {
-			t.Errorf("uuid %q: AppID = %q, want com.example.app", r.UUID, r.AppID)
-		}
-		if got := r.Values["bpm"]; got != want.bpm {
-			t.Errorf("uuid %q: bpm = %v, want %v", r.UUID, got, want.bpm)
-		}
-	}
-	if len(seen) != 3 {
-		t.Errorf("expected 3 distinct uuids, got %d", len(seen))
-	}
-}
-
-// --- 存在しないテーブル ---
-
-func TestReadDB_MissingSourceTable_ReturnsEmptySliceNoError(t *testing.T) {
-	dbPath := newFixtureDB(t)
-	tc := instantTypeConfig()
-	tc.SourceTable = "table_does_not_exist"
-	cfg := &config.Config{Types: map[string]config.TypeConfig{"missing_type": tc}}
-
-	got, err := ReadDB(dbPath, cfg, nil)
-	if err != nil {
-		t.Fatalf("ReadDB: %v", err)
-	}
-	recs, ok := got.Records["missing_type"]
-	if !ok {
-		t.Fatalf("expected key %q to be present", "missing_type")
-	}
-	if len(recs) != 0 {
-		t.Errorf("expected empty slice, got %d records", len(recs))
-	}
-}
-
-func TestReadDB_MissingSeriesTable_ReturnsEmptySliceNoError(t *testing.T) {
-	dbPath := newFixtureDB(t)
-	tc := seriesTypeConfig()
-	tc.SeriesTable = "series_table_does_not_exist"
-	cfg := &config.Config{Types: map[string]config.TypeConfig{"missing_series": tc}}
-
-	got, err := ReadDB(dbPath, cfg, nil)
-	if err != nil {
-		t.Fatalf("ReadDB: %v", err)
-	}
-	recs, ok := got.Records["missing_series"]
-	if !ok {
-		t.Fatalf("expected key %q to be present", "missing_series")
-	}
-	if len(recs) != 0 {
-		t.Errorf("expected empty slice, got %d records", len(recs))
-	}
-}
-
-// --- 識別子検証（SQLインジェクション対策） ---
-
-func TestReadDB_Series_CamelCaseSourceTable(t *testing.T) {
-	dbPath := newFixtureDB(t)
-	cfg := &config.Config{Types: map[string]config.TypeConfig{"camel_series_type": camelSeriesTypeConfig()}}
-
-	got, err := ReadDB(dbPath, cfg, nil)
-	if err != nil {
-		t.Fatalf("ReadDB: %v", err)
-	}
-	recs, ok := got.Records["camel_series_type"]
-	if !ok || len(recs) != 1 {
-		t.Fatalf("expected 1 record for camel_series_type, got %+v", got.Records["camel_series_type"])
-	}
-	if recs[0].Values["speed"] != 1.5 {
-		t.Errorf("speed = %v, want 1.5", recs[0].Values["speed"])
-	}
-}
-
-func TestReadDB_InvalidSourceTable_Errors(t *testing.T) {
-	dbPath := newFixtureDB(t)
-	tc := instantTypeConfig()
-	tc.SourceTable = "hc_instant; DROP TABLE hc_instant;--"
-	cfg := &config.Config{Types: map[string]config.TypeConfig{"evil": tc}}
-
-	if _, err := ReadDB(dbPath, cfg, nil); err == nil {
-		t.Fatalf("expected error for invalid source_table, got nil")
-	}
-
-	// テーブルが実際に残っていることも確認する。
-	db, err := sql.Open("sqlite", dbPath)
-	if err != nil {
-		t.Fatalf("open db: %v", err)
-	}
-	defer func() { _ = db.Close() }()
-	var count int
-	if err := db.QueryRow("SELECT COUNT(*) FROM hc_instant").Scan(&count); err != nil {
-		t.Fatalf("hc_instant should still exist: %v", err)
-	}
-}
-
-// --- ExtractDB ---
 
 func buildZip(t *testing.T, entries map[string][]byte) []byte {
 	t.Helper()
@@ -469,57 +103,6 @@ func TestExtractDB_NoDBEntry_Errors(t *testing.T) {
 
 // --- Reader.Read: 一時ファイルの後始末 ---
 
-func TestReader_Read_CleansUpTempFile(t *testing.T) {
-	dbPath := newFixtureDB(t)
-	dbData, err := os.ReadFile(dbPath)
-	if err != nil {
-		t.Fatalf("read fixture db: %v", err)
-	}
-	zipData := buildZip(t, map[string][]byte{"export.db": dbData})
-
-	tempDir := t.TempDir()
-	r := &Reader{TempDir: tempDir}
-	cfg := &config.Config{Types: map[string]config.TypeConfig{"instant_type": instantTypeConfig()}}
-
-	got, err := r.Read(&model.ZipFile{Data: zipData}, cfg)
-	if err != nil {
-		t.Fatalf("Read: %v", err)
-	}
-	if len(got.Records["instant_type"]) != 2 {
-		t.Fatalf("expected 2 records, got %d", len(got.Records["instant_type"]))
-	}
-
-	entries, err := os.ReadDir(tempDir)
-	if err != nil {
-		t.Fatalf("read temp dir: %v", err)
-	}
-	if len(entries) != 0 {
-		t.Errorf("expected TempDir to be empty after Read, found %v", entries)
-	}
-}
-
-func TestReader_Read_CleansUpTempFileOnError(t *testing.T) {
-	zipData := buildZip(t, map[string][]byte{"readme.txt": []byte("no db here")})
-
-	tempDir := t.TempDir()
-	r := &Reader{TempDir: tempDir}
-	cfg := &config.Config{Types: map[string]config.TypeConfig{"instant_type": instantTypeConfig()}}
-
-	if _, err := r.Read(&model.ZipFile{Data: zipData}, cfg); err == nil {
-		t.Fatalf("expected error for zip with no .db entry")
-	}
-
-	entries, err := os.ReadDir(tempDir)
-	if err != nil {
-		t.Fatalf("read temp dir: %v", err)
-	}
-	if len(entries) != 0 {
-		t.Errorf("expected TempDir to be empty after failed Read, found %v", entries)
-	}
-}
-
-// newPriorityDB は優先度テーブルを持つエクスポートDB相当のファイルを作る。
-// hasPriorityTable が偽なら、優先度テーブルの無い（古い/別実装の）エクスポートを再現する。
 func newPriorityDB(t *testing.T, hasPriorityTable bool) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "priority.db")
@@ -555,25 +138,14 @@ func newPriorityDB(t *testing.T, hasPriorityTable bool) string {
 	return path
 }
 
-func priorityTestConfig() *config.Config {
-	return &config.Config{Types: map[string]config.TypeConfig{
-		"instant_type": {
-			SourceTable: "hc_instant",
-			TimeLayout:  config.LayoutInstant,
-			Columns:     map[string]config.ColumnConfig{"a": {Column: "value_a", Scale: 1}},
-			Window:      "all",
-			Daily:       []string{"mean"},
-		},
-	}}
-}
-
-func TestReadDBReadsAppPriorities(t *testing.T) {
-	got, err := ReadDB(newPriorityDB(t, true), priorityTestConfig(), nil)
+func TestReadAppPriorities(t *testing.T) {
+	db := mustOpen(t, newPriorityDB(t, true))
+	got, err := ReadAppPriorities(context.Background(), db)
 	if err != nil {
-		t.Fatalf("ReadDB: %v", err)
+		t.Fatalf("ReadAppPriorities: %v", err)
 	}
 
-	activity := got.Priorities[1]
+	activity := got[1]
 	want := []string{"com.example.band", "com.example.fit"}
 	if len(activity) != len(want) {
 		t.Fatalf("priorities[1] = %v, want %v", activity, want)
@@ -583,49 +155,45 @@ func TestReadDBReadsAppPriorities(t *testing.T) {
 			t.Fatalf("priorities[1] = %v, want %v", activity, want)
 		}
 	}
-	if len(got.Priorities[5]) != 1 || got.Priorities[5][0] != "com.example.fit" {
-		t.Errorf("priorities[5] = %v, want [com.example.fit]", got.Priorities[5])
+	if len(got[5]) != 1 || got[5][0] != "com.example.fit" {
+		t.Errorf("priorities[5] = %v, want [com.example.fit]", got[5])
 	}
 }
 
-func TestReadDBWithoutPriorityTable(t *testing.T) {
-	got, err := ReadDB(newPriorityDB(t, false), priorityTestConfig(), nil)
+func TestReadAppPriorities_WithoutPriorityTable(t *testing.T) {
+	db := mustOpen(t, newPriorityDB(t, false))
+	got, err := ReadAppPriorities(context.Background(), db)
 	if err != nil {
-		t.Fatalf("ReadDB: %v", err)
+		t.Fatalf("ReadAppPriorities: %v", err)
 	}
-	if len(got.Priorities) != 0 {
-		t.Errorf("priorities = %v, want empty", got.Priorities)
+	if len(got) != 0 {
+		t.Errorf("priorities = %v, want empty", got)
 	}
 }
 
-// --- ReadDB: TableRows ---
+// --- ReadTableRows ---
 
-func TestReadDB_TableRowsCountsAllTablesRegardlessOfConfig(t *testing.T) {
-	dbPath := newFixtureDB(t)
-	// config には instant_type だけを登録する。TableRows は config と無関係に
-	// DB内の全テーブルを数えるため、未登録のテーブルも出るはず。
-	cfg := &config.Config{Types: map[string]config.TypeConfig{"instant_type": instantTypeConfig()}}
-
-	got, err := ReadDB(dbPath, cfg, nil)
+// TestReadTableRows_CountsAllTablesRegardlessOfKinds は、取り込み対象の種別に
+// 関わらずDB内の全テーブルを数えることを確認する。未登録のテーブルへ書き込みが
+// 始まったことに気づくのが目的なので、名前や登録の有無で絞らない。
+func TestReadTableRows_CountsAllTablesRegardlessOfKinds(t *testing.T) {
+	db := mustOpen(t, newPriorityDB(t, true))
+	got, err := ReadTableRows(context.Background(), db, nil)
 	if err != nil {
-		t.Fatalf("ReadDB: %v", err)
+		t.Fatalf("ReadTableRows: %v", err)
 	}
 
 	want := map[string]int64{
-		"application_info_table": 1,
-		"hc_instant":             2,
-		"hc_interval":            1,
-		"hc_series_parent":       1,
-		"hc_series_child":        3,
-		"CamelSeriesParent":      1,
-		"camel_series_child":     1,
+		"application_info_table":              2,
+		"hc_instant":                          0,
+		"health_data_category_priority_table": 2,
 	}
-	if !reflect.DeepEqual(got.TableRows, want) {
-		t.Fatalf("TableRows mismatch\n got: %#v\nwant: %#v", got.TableRows, want)
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("TableRows mismatch\n got: %#v\nwant: %#v", got, want)
 	}
 }
 
-func TestReadDB_TableRowsIncludesEmptyTablesAndExcludesNonTables(t *testing.T) {
+func TestReadTableRows_IncludesEmptyTablesAndExcludesNonTables(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "tables.db")
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
@@ -658,9 +226,9 @@ func TestReadDB_TableRowsIncludesEmptyTablesAndExcludesNonTables(t *testing.T) {
 		t.Fatalf("close db: %v", err)
 	}
 
-	got, err := ReadDB(path, &config.Config{Types: map[string]config.TypeConfig{}}, nil)
+	got, err := ReadTableRows(context.Background(), mustOpen(t, path), nil)
 	if err != nil {
-		t.Fatalf("ReadDB: %v", err)
+		t.Fatalf("ReadTableRows: %v", err)
 	}
 
 	want := map[string]int64{
@@ -669,8 +237,8 @@ func TestReadDB_TableRowsIncludesEmptyTablesAndExcludesNonTables(t *testing.T) {
 		`we"ird`:               1,
 		"sqliteX_not_internal": 0,
 	}
-	if !reflect.DeepEqual(got.TableRows, want) {
-		t.Fatalf("TableRows mismatch\n got: %#v\nwant: %#v", got.TableRows, want)
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("TableRows mismatch\n got: %#v\nwant: %#v", got, want)
 	}
 }
 
@@ -687,7 +255,7 @@ func TestQuoteIdentifier(t *testing.T) {
 	}
 }
 
-func TestReadDB_TableRowsSkipsFailingTableAndLogs(t *testing.T) {
+func TestReadTableRows_SkipsFailingTableAndLogs(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "broken.db")
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
@@ -715,14 +283,14 @@ func TestReadDB_TableRowsSkipsFailingTableAndLogs(t *testing.T) {
 	var logs bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn}))
 
-	got, err := ReadDB(path, &config.Config{Types: map[string]config.TypeConfig{}}, logger)
+	got, err := ReadTableRows(context.Background(), mustOpen(t, path), logger)
 	if err != nil {
-		t.Fatalf("ReadDB: %v", err)
+		t.Fatalf("ReadTableRows: %v", err)
 	}
 
 	want := map[string]int64{"ok_table": 1}
-	if !reflect.DeepEqual(got.TableRows, want) {
-		t.Fatalf("TableRows mismatch\n got: %#v\nwant: %#v", got.TableRows, want)
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("TableRows mismatch\n got: %#v\nwant: %#v", got, want)
 	}
 	if !strings.Contains(logs.String(), "ghost") {
 		t.Errorf("log does not mention the failing table: %q", logs.String())

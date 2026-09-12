@@ -19,11 +19,14 @@
 | `HC_SPREADSHEET_ID` | 出力先スプレッドシートID | （必須） |
 | `HC_SA_KEY_PATH` | サービスアカウント鍵 | `/run/secrets/sa-key.json` |
 | `HC_DB_PATH` | 累積SQLite | `/data/health.db` |
-| `HC_CONFIG_PATH` | 設定ファイル | `/app/config.yaml` |
 | `HC_POLL_INTERVAL` | ポーリング間隔 | `1h` |
 | `HC_LOG_LEVEL` | ログレベル | `info` |
 
 `.env` の配置は `mini-pc-setup` 側の Ansible role が Vault から行う（SA鍵と同じ経路）。
+
+## その後の変更
+
+2026-09-12 に `config.yaml` を廃止したため（[ADR 0012](0012-split-measured-data-from-aggregation-model.md)）、環境変数 `HC_CONFIG_PATH` も無くなった。上の表からは削除済み。デプロイ固有の値を環境変数で渡すという決定自体は変わらない。
 
 ## 結果
 

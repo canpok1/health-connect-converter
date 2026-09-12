@@ -1,0 +1,16 @@
+[
+ [
+  "local_date",
+  "local_start",
+  "local_end",
+  "app_id",
+  "cm"
+ ],
+ [
+  "2026-09-10",
+  "2026-09-10 07:00:00",
+  "2026-09-10 07:00:00",
+  "com.google.android.apps.fitness",
+  167
+ ]
+]

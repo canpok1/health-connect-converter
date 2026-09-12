@@ -1,664 +1,336 @@
-package store_test
+package store
 
 import (
 	"context"
+	"database/sql"
 	"path/filepath"
 	"testing"
 	"time"
 
-	"health-connect-converter/internal/config"
+	"health-connect-converter/internal/cumdb"
+	"health-connect-converter/internal/kind"
 	"health-connect-converter/internal/model"
-	"health-connect-converter/internal/store"
 )
 
-func openTestStore(t *testing.T) *store.Store {
+// --- テスト用の種別 ---
+//
+// 本物の種別（internal/kind）は非公開なので、ここでは同じインターフェースを
+// 満たす最小の種別を用意する。値列は v ひとつ。
+//
+// レコードは「開始から1分間」の期間として保存する。瞬間の記録（開始＝終了）だと
+// 時間帯の重なりが生じず重複排除を試せないため。
+
+type testKind struct {
+	key    string
+	policy kind.Policy
+}
+
+func (k testKind) Key() string         { return k.key }
+func (k testKind) Policy() kind.Policy { return k.policy }
+
+func (k testKind) Table() cumdb.Table {
+	return cumdb.Table{
+		Name: "record_" + k.key,
+		Columns: []cumdb.Column{
+			{Name: "uuid", Type: "TEXT"},
+			{Name: "start_time", Type: "INTEGER"},
+			{Name: "end_time", Type: "INTEGER"},
+			{Name: "zone_offset", Type: "INTEGER"},
+			{Name: "app_id", Type: "TEXT"},
+			{Name: "v", Type: "REAL"},
+		},
+		TimeColumn: "start_time",
+		DateExpr:   cumdb.LocalDateExpr("start_time", "zone_offset"),
+	}
+}
+
+func (k testKind) ExportRows(ctx context.Context, exportDB *sql.DB) ([][]any, []string, error) {
+	rows, err := exportDB.QueryContext(ctx, "SELECT uuid, time, zone_offset, app_id, v FROM src ORDER BY time")
+	if err != nil {
+		return nil, nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var out [][]any
+	var dates []string
+	for rows.Next() {
+		var uuid, appID string
+		var tm int64
+		var zone int32
+		var v float64
+		if err := rows.Scan(&uuid, &tm, &zone, &appID, &v); err != nil {
+			return nil, nil, err
+		}
+		out = append(out, []any{uuid, tm, tm + testDurationMs, zone, appID, v})
+		dates = append(dates, localDateForTest(tm, zone))
+	}
+	return out, dates, rows.Err()
+}
+
+func (k testKind) records(ctx context.Context, cum *sql.DB, sinceMs int64) ([]model.AggRecord, error) {
+	rows, err := k.Table().Query(ctx, cum, sinceMs)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var out []model.AggRecord
+	for rows.Next() {
+		var uuid, appID string
+		var start, end int64
+		var zone int32
+		var v sql.NullFloat64
+		if err := rows.Scan(&uuid, &start, &end, &zone, &appID, &v); err != nil {
+			return nil, err
+		}
+		values := map[string]float64{}
+		if v.Valid {
+			values["v"] = v.Float64
+		}
+		out = append(out, model.AggRecord{
+			LocalDate: localDateForTest(start, zone), StartTime: start, EndTime: end,
+			ZoneOffset: zone, AppID: appID, Values: values,
+		})
+	}
+	return out, rows.Err()
+}
+
+func (k testKind) Aggregate(ctx context.Context, cum *sql.DB) ([]model.AggRecord, error) {
+	return k.records(ctx, cum, 0)
+}
+
+func (k testKind) ValueNames() []string { return []string{"v"} }
+func (k testKind) RawHeader() []any     { return []any{"local_date", "v"} }
+
+func (k testKind) RawRows(ctx context.Context, cum *sql.DB, sinceMs int64) ([][]any, error) {
+	recs, err := k.records(ctx, cum, sinceMs)
+	if err != nil {
+		return nil, err
+	}
+	out := make([][]any, 0, len(recs))
+	for _, rec := range recs {
+		out = append(out, []any{rec.LocalDate, rec.Values["v"]})
+	}
+	return out, nil
+}
+
+func localDateForTest(ms int64, zoneOffset int32) string {
+	return time.Unix(ms/1000+int64(zoneOffset), 0).UTC().Format("2006-01-02")
+}
+
+// --- ヘルパー ---
+
+const zoneJST = 32400
+
+// testDurationMs はテスト用の種別が1レコードに与える長さ（1分）。
+const testDurationMs = int64(60 * 1000)
+
+// jstNoon は 2026-09-11 12:00 JST（UTC epoch ms）。
+const jstNoon = int64(1789095600000)
+
+func newStore(t *testing.T) *Store {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "test.db")
-	s, err := store.Open(path)
+	st, err := Open(filepath.Join(t.TempDir(), "sub", "cum.db"))
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	t.Cleanup(func() {
-		if err := s.Close(); err != nil {
-			t.Errorf("Close: %v", err)
-		}
-	})
-	return s
+	t.Cleanup(func() { _ = st.Close() })
+	return st
 }
 
-func weightConfig(extraColumns ...string) config.TypeConfig {
-	cols := map[string]config.ColumnConfig{
-		"weight_kg": {Column: "weight", Scale: 1},
-	}
-	for _, name := range extraColumns {
-		cols[name] = config.ColumnConfig{Column: name, Scale: 1}
-	}
-	return config.TypeConfig{
-		SourceTable: "weight_record",
-		TimeLayout:  config.LayoutInstant,
-		Columns:     cols,
-		Window:      "all",
-		Daily:       []string{"mean", "min", "max", "sum", "count"},
-	}
-}
-
-func sleepConfig() config.TypeConfig {
-	return config.TypeConfig{
-		SourceTable:     "sleep_session_record",
-		TimeLayout:      config.LayoutInterval,
-		Window:          "all",
-		Daily:           []string{"sum", "count"},
-		IncludeDuration: true,
-	}
-}
-
-func utcMs(t *testing.T, layout string) int64 {
+// newExportDB はテスト用の種別が読むエクスポートDBを作る。
+func newExportDB(t *testing.T, rows [][]any) *sql.DB {
 	t.Helper()
-	parsed, err := time.Parse(time.RFC3339, layout)
+	db, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "export.db"))
 	if err != nil {
-		t.Fatalf("time.Parse(%q): %v", layout, err)
+		t.Fatalf("open export db: %v", err)
 	}
-	return parsed.UnixMilli()
+	t.Cleanup(func() { _ = db.Close() })
+	if _, err := db.Exec(`CREATE TABLE src (uuid TEXT, time INTEGER, zone_offset INTEGER, app_id TEXT, v REAL)`); err != nil {
+		t.Fatalf("ddl: %v", err)
+	}
+	for _, r := range rows {
+		if _, err := db.Exec(`INSERT INTO src (uuid, time, zone_offset, app_id, v) VALUES (?, ?, ?, ?, ?)`, r...); err != nil {
+			t.Fatalf("insert: %v", err)
+		}
+	}
+	return db
 }
 
-func TestMigrateIdempotent(t *testing.T) {
-	s := openTestStore(t)
+// --- テスト ---
+
+func TestIngestAndDailyAggregates(t *testing.T) {
 	ctx := context.Background()
-	cfg := &config.Config{Types: map[string]config.TypeConfig{"weight": weightConfig()}}
+	st := newStore(t)
+	k := testKind{key: "t1", policy: kind.Policy{Window: kind.WindowAll, Daily: []string{kind.FuncSum, kind.FuncCount}}}
 
-	if err := s.Migrate(ctx, cfg); err != nil {
-		t.Fatalf("Migrate #1: %v", err)
-	}
-	if err := s.Migrate(ctx, cfg); err != nil {
-		t.Fatalf("Migrate #2: %v", err)
-	}
-}
-
-func TestMigrateAddsColumnAndKeepsExistingRows(t *testing.T) {
-	s := openTestStore(t)
-	ctx := context.Background()
-
-	tc1 := weightConfig()
-	cfg1 := &config.Config{Types: map[string]config.TypeConfig{"weight": tc1}}
-	if err := s.Migrate(ctx, cfg1); err != nil {
-		t.Fatalf("Migrate #1: %v", err)
-	}
-
-	rec := model.Record{
-		UUID:       "u1",
-		StartTime:  utcMs(t, "2024-01-01T00:00:00Z"),
-		EndTime:    utcMs(t, "2024-01-01T00:00:00Z"),
-		ZoneOffset: 0,
-		AppID:      "app1",
-		Values:     map[string]float64{"weight_kg": 50},
-	}
-	if _, err := s.ReplaceRecords(ctx, "weight", tc1, []model.Record{rec}); err != nil {
-		t.Fatalf("UpsertRecords: %v", err)
-	}
-
-	tc2 := weightConfig("height_cm")
-	cfg2 := &config.Config{Types: map[string]config.TypeConfig{"weight": tc2}}
-	if err := s.Migrate(ctx, cfg2); err != nil {
-		t.Fatalf("Migrate #2 (add column): %v", err)
-	}
-
-	recs, err := s.RecordsSince(ctx, "weight", tc2, 0)
-	if err != nil {
-		t.Fatalf("RecordsSince: %v", err)
-	}
-	if len(recs) != 1 {
-		t.Fatalf("len(recs) = %d, want 1", len(recs))
-	}
-	got := recs[0]
-	if got.UUID != "u1" {
-		t.Errorf("UUID = %q, want u1", got.UUID)
-	}
-	if v, ok := got.Values["weight_kg"]; !ok || v != 50 {
-		t.Errorf("weight_kg = %v, %v; want 50, true", v, ok)
-	}
-	if _, ok := got.Values["height_cm"]; ok {
-		t.Errorf("height_cm should be NULL (absent), got present")
-	}
-
-	rec2 := model.Record{
-		UUID:       "u2",
-		StartTime:  utcMs(t, "2024-01-02T00:00:00Z"),
-		EndTime:    utcMs(t, "2024-01-02T00:00:00Z"),
-		ZoneOffset: 0,
-		AppID:      "app1",
-		Values:     map[string]float64{"weight_kg": 60, "height_cm": 170},
-	}
-	if _, err := s.ReplaceRecords(ctx, "weight", tc2, []model.Record{rec2}); err != nil {
-		t.Fatalf("UpsertRecords into new column: %v", err)
-	}
-	recs2, err := s.RecordsSince(ctx, "weight", tc2, 0)
-	if err != nil {
-		t.Fatalf("RecordsSince #2: %v", err)
-	}
-	if len(recs2) != 2 {
-		t.Fatalf("len(recs2) = %d, want 2", len(recs2))
-	}
-}
-
-func TestUpsertRecordsUpdatesExistingUUID(t *testing.T) {
-	s := openTestStore(t)
-	ctx := context.Background()
-	tc := weightConfig()
-	cfg := &config.Config{Types: map[string]config.TypeConfig{"weight": tc}}
-	if err := s.Migrate(ctx, cfg); err != nil {
+	if err := st.Migrate(ctx, []kind.Kind{k}); err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
 
-	rec := model.Record{
-		UUID:       "u1",
-		StartTime:  utcMs(t, "2024-01-01T00:00:00Z"),
-		EndTime:    utcMs(t, "2024-01-01T00:00:00Z"),
-		ZoneOffset: 0,
-		AppID:      "app1",
-		Values:     map[string]float64{"weight_kg": 50},
-	}
-	if n, err := s.ReplaceRecords(ctx, "weight", tc, []model.Record{rec}); err != nil || n != 1 {
-		t.Fatalf("UpsertRecords #1: n=%d, err=%v", n, err)
-	}
-
-	rec.Values["weight_kg"] = 70
-	rec.AppID = "app2"
-	if n, err := s.ReplaceRecords(ctx, "weight", tc, []model.Record{rec}); err != nil || n != 1 {
-		t.Fatalf("UpsertRecords #2: n=%d, err=%v", n, err)
-	}
-
-	stats, err := s.TypeStats(ctx, "weight")
+	exportDB := newExportDB(t, [][]any{
+		{"u1", jstNoon, zoneJST, "app", 10.0},
+		{"u2", jstNoon + 1000, zoneJST, "app", 20.0},
+	})
+	n, err := st.Ingest(ctx, k, exportDB)
 	if err != nil {
-		t.Fatalf("TypeStats: %v", err)
+		t.Fatalf("Ingest: %v", err)
+	}
+	if n != 2 {
+		t.Errorf("取り込み件数 = %d, want 2", n)
+	}
+
+	rows, err := st.DailyAggregates(ctx, k)
+	if err != nil {
+		t.Fatalf("DailyAggregates: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("日数 = %d, want 1（%+v）", len(rows), rows)
+	}
+	if rows[0].Values["v_sum"] != 30 || rows[0].Values["count"] != 2 {
+		t.Errorf("集計 = %+v, want v_sum=30 count=2", rows[0].Values)
+	}
+}
+
+// TestIngestTwiceIsIdempotent は同じエクスポートを2回取り込んでも件数が増えない
+// ことを確認する（取り込みは毎回同じZIPを読み直す可能性がある）。
+func TestIngestTwiceIsIdempotent(t *testing.T) {
+	ctx := context.Background()
+	st := newStore(t)
+	k := testKind{key: "t1", policy: kind.Policy{Window: kind.WindowAll, Daily: []string{kind.FuncSum}}}
+	if err := st.Migrate(ctx, []kind.Kind{k}); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+	exportDB := newExportDB(t, [][]any{{"u1", jstNoon, zoneJST, "app", 10.0}})
+
+	for i := 0; i < 2; i++ {
+		if _, err := st.Ingest(ctx, k, exportDB); err != nil {
+			t.Fatalf("Ingest %d回目: %v", i+1, err)
+		}
+	}
+
+	stats, err := st.Stats(ctx, k)
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
 	}
 	if stats.Count != 1 {
-		t.Fatalf("Count = %d, want 1 (row must be updated, not duplicated)", stats.Count)
-	}
-
-	recs, err := s.RecordsSince(ctx, "weight", tc, 0)
-	if err != nil {
-		t.Fatalf("RecordsSince: %v", err)
-	}
-	if len(recs) != 1 {
-		t.Fatalf("len(recs) = %d, want 1", len(recs))
-	}
-	if recs[0].Values["weight_kg"] != 70 {
-		t.Errorf("weight_kg = %v, want 70", recs[0].Values["weight_kg"])
-	}
-	if recs[0].AppID != "app2" {
-		t.Errorf("AppID = %q, want app2", recs[0].AppID)
+		t.Errorf("件数 = %d, want 1", stats.Count)
 	}
 }
 
-func TestUpsertRecordsEmptyIsNoop(t *testing.T) {
-	s := openTestStore(t)
+func TestRawRowsRespectsSince(t *testing.T) {
 	ctx := context.Background()
-	tc := weightConfig()
-	cfg := &config.Config{Types: map[string]config.TypeConfig{"weight": tc}}
-	if err := s.Migrate(ctx, cfg); err != nil {
+	st := newStore(t)
+	k := testKind{key: "t1", policy: kind.Policy{Window: "1d", Daily: []string{kind.FuncSum}}}
+	if err := st.Migrate(ctx, []kind.Kind{k}); err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-	n, err := s.ReplaceRecords(ctx, "weight", tc, nil)
-	if err != nil || n != 0 {
-		t.Fatalf("UpsertRecords(nil) = %d, %v; want 0, nil", n, err)
+	exportDB := newExportDB(t, [][]any{
+		{"old", jstNoon - 5*86400000, zoneJST, "app", 1.0},
+		{"new", jstNoon, zoneJST, "app", 2.0},
+	})
+	if _, err := st.Ingest(ctx, k, exportDB); err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+
+	rows, err := st.RawRows(ctx, k, jstNoon-86400000)
+	if err != nil {
+		t.Fatalf("RawRows: %v", err)
+	}
+	if len(rows) != 1 || rows[0][1] != 2.0 {
+		t.Errorf("rows = %+v, want 直近の1件だけ", rows)
 	}
 }
 
-func TestRecordsSinceOrderingAndBoundary(t *testing.T) {
-	s := openTestStore(t)
+// TestDailyAggregatesUsesSavedPriorities は、保存済みのアプリ優先度が重複排除に
+// 使われることを確認する。
+func TestDailyAggregatesUsesSavedPriorities(t *testing.T) {
 	ctx := context.Background()
-	tc := weightConfig()
-	cfg := &config.Config{Types: map[string]config.TypeConfig{"weight": tc}}
-	if err := s.Migrate(ctx, cfg); err != nil {
+	st := newStore(t)
+	k := testKind{key: "t1", policy: kind.Policy{
+		Window: kind.WindowAll, Daily: []string{kind.FuncSum},
+		Dedupe: true, Category: kind.CategoryActivity,
+	}}
+	if err := st.Migrate(ctx, []kind.Kind{k}); err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
-
-	t1 := utcMs(t, "2024-01-01T00:00:00Z")
-	t2 := utcMs(t, "2024-01-02T00:00:00Z")
-	t3 := utcMs(t, "2024-01-03T00:00:00Z")
-	recs := []model.Record{
-		{UUID: "u3", StartTime: t3, EndTime: t3, Values: map[string]float64{"weight_kg": 3}},
-		{UUID: "u1", StartTime: t1, EndTime: t1, Values: map[string]float64{"weight_kg": 1}},
-		{UUID: "u2", StartTime: t2, EndTime: t2, Values: map[string]float64{"weight_kg": 2}},
-	}
-	if _, err := s.ReplaceRecords(ctx, "weight", tc, recs); err != nil {
-		t.Fatalf("UpsertRecords: %v", err)
+	if err := st.SetAppPriorities(ctx, model.AppPriorities{kind.CategoryActivity: {"top", "low"}}); err != nil {
+		t.Fatalf("SetAppPriorities: %v", err)
 	}
 
-	got, err := s.RecordsSince(ctx, "weight", tc, t2)
-	if err != nil {
-		t.Fatalf("RecordsSince: %v", err)
-	}
-	if len(got) != 2 {
-		t.Fatalf("len(got) = %d, want 2 (boundary t2 must be included)", len(got))
-	}
-	if got[0].UUID != "u2" || got[1].UUID != "u3" {
-		t.Fatalf("got UUIDs = [%s, %s], want [u2, u3]", got[0].UUID, got[1].UUID)
+	// 同じ時刻を2アプリが記録している。優先度の高い方だけを数えるはず。
+	exportDB := newExportDB(t, [][]any{
+		{"u1", jstNoon, zoneJST, "top", 100.0},
+		{"u2", jstNoon, zoneJST, "low", 100.0},
+	})
+	if _, err := st.Ingest(ctx, k, exportDB); err != nil {
+		t.Fatalf("Ingest: %v", err)
 	}
 
-	all, err := s.RecordsSince(ctx, "weight", tc, 0)
-	if err != nil {
-		t.Fatalf("RecordsSince(0): %v", err)
-	}
-	if len(all) != 3 {
-		t.Fatalf("len(all) = %d, want 3", len(all))
-	}
-	if all[0].UUID != "u1" || all[1].UUID != "u2" || all[2].UUID != "u3" {
-		t.Fatalf("all not in ascending start_time order: %v", all)
-	}
-}
-
-func TestDailyAggregatesZoneOffsetAndFunctions(t *testing.T) {
-	s := openTestStore(t)
-	ctx := context.Background()
-	tc := weightConfig()
-	cfg := &config.Config{Types: map[string]config.TypeConfig{"weight": tc}}
-	if err := s.Migrate(ctx, cfg); err != nil {
-		t.Fatalf("Migrate: %v", err)
-	}
-
-	const zoneOffset = 32400 // JST, +9h
-
-	// UTC 2024-01-01T20:00:00 は zone_offset=32400 で現地 2024-01-02T05:00:00。
-	tA := utcMs(t, "2024-01-01T20:00:00Z")
-	// UTC 2024-01-02T00:00:00 は zone_offset=32400 で現地 2024-01-02T09:00:00。
-	// UTC 日付は tA と別日だが、現地日は tA と同じ 2024-01-02 にまとまるはず。
-	tB := utcMs(t, "2024-01-02T00:00:00Z")
-	// weight_kg が欠測の行。count には数えるが mean/min/max/sum の分母には入らない。
-	tC := utcMs(t, "2024-01-02T01:00:00Z")
-
-	recs := []model.Record{
-		{UUID: "a", StartTime: tA, EndTime: tA, ZoneOffset: zoneOffset, Values: map[string]float64{"weight_kg": 50}},
-		{UUID: "b", StartTime: tB, EndTime: tB, ZoneOffset: zoneOffset, Values: map[string]float64{"weight_kg": 60}},
-		{UUID: "c", StartTime: tC, EndTime: tC, ZoneOffset: zoneOffset, Values: map[string]float64{}},
-	}
-	if _, err := s.ReplaceRecords(ctx, "weight", tc, recs); err != nil {
-		t.Fatalf("UpsertRecords: %v", err)
-	}
-
-	rows, err := s.DailyAggregates(ctx, "weight", tc)
+	rows, err := st.DailyAggregates(ctx, k)
 	if err != nil {
 		t.Fatalf("DailyAggregates: %v", err)
 	}
-	if len(rows) != 1 {
-		t.Fatalf("len(rows) = %d, want 1 (all three records fall in the same local day)", len(rows))
-	}
-	row := rows[0]
-	if row.Date != "2024-01-02" {
-		t.Fatalf("Date = %q, want 2024-01-02", row.Date)
-	}
-	if row.Values["count"] != 3 {
-		t.Errorf("count = %v, want 3", row.Values["count"])
-	}
-	if row.Values["weight_kg_mean"] != 55 {
-		t.Errorf("weight_kg_mean = %v, want 55 (NULL row must not affect the denominator)", row.Values["weight_kg_mean"])
-	}
-	if row.Values["weight_kg_min"] != 50 {
-		t.Errorf("weight_kg_min = %v, want 50", row.Values["weight_kg_min"])
-	}
-	if row.Values["weight_kg_max"] != 60 {
-		t.Errorf("weight_kg_max = %v, want 60", row.Values["weight_kg_max"])
-	}
-	if row.Values["weight_kg_sum"] != 110 {
-		t.Errorf("weight_kg_sum = %v, want 110", row.Values["weight_kg_sum"])
-	}
-}
-
-func TestDailyAggregatesSeparatesDifferentLocalDays(t *testing.T) {
-	s := openTestStore(t)
-	ctx := context.Background()
-	tc := weightConfig()
-	cfg := &config.Config{Types: map[string]config.TypeConfig{"weight": tc}}
-	if err := s.Migrate(ctx, cfg); err != nil {
-		t.Fatalf("Migrate: %v", err)
-	}
-
-	t1 := utcMs(t, "2024-01-01T00:00:00Z")
-	t2 := utcMs(t, "2024-01-02T00:00:00Z")
-	recs := []model.Record{
-		{UUID: "a", StartTime: t1, EndTime: t1, Values: map[string]float64{"weight_kg": 10}},
-		{UUID: "b", StartTime: t2, EndTime: t2, Values: map[string]float64{"weight_kg": 20}},
-	}
-	if _, err := s.ReplaceRecords(ctx, "weight", tc, recs); err != nil {
-		t.Fatalf("UpsertRecords: %v", err)
-	}
-
-	rows, err := s.DailyAggregates(ctx, "weight", tc)
-	if err != nil {
-		t.Fatalf("DailyAggregates: %v", err)
-	}
-	if len(rows) != 2 {
-		t.Fatalf("len(rows) = %d, want 2", len(rows))
-	}
-	if rows[0].Date != "2024-01-01" || rows[1].Date != "2024-01-02" {
-		t.Fatalf("dates = [%s, %s], want [2024-01-01, 2024-01-02]", rows[0].Date, rows[1].Date)
-	}
-}
-
-func TestDailyAggregatesDurationMinSum(t *testing.T) {
-	s := openTestStore(t)
-	ctx := context.Background()
-	tc := sleepConfig()
-	cfg := &config.Config{Types: map[string]config.TypeConfig{"sleep": tc}}
-	if err := s.Migrate(ctx, cfg); err != nil {
-		t.Fatalf("Migrate: %v", err)
-	}
-
-	start1 := utcMs(t, "2024-01-01T22:00:00Z")
-	end1 := utcMs(t, "2024-01-01T23:30:00Z") // 90分
-	start2 := utcMs(t, "2024-01-01T23:45:00Z")
-	end2 := utcMs(t, "2024-01-02T00:15:00Z") // 30分
-
-	recs := []model.Record{
-		{UUID: "a", StartTime: start1, EndTime: end1, Values: map[string]float64{}},
-		{UUID: "b", StartTime: start2, EndTime: end2, Values: map[string]float64{}},
-	}
-	if _, err := s.ReplaceRecords(ctx, "sleep", tc, recs); err != nil {
-		t.Fatalf("UpsertRecords: %v", err)
-	}
-
-	rows, err := s.DailyAggregates(ctx, "sleep", tc)
-	if err != nil {
-		t.Fatalf("DailyAggregates: %v", err)
-	}
-	if len(rows) != 1 {
-		t.Fatalf("len(rows) = %d, want 1", len(rows))
-	}
-	if rows[0].Values["duration_min_sum"] != 120 {
-		t.Errorf("duration_min_sum = %v, want 120", rows[0].Values["duration_min_sum"])
-	}
-	if rows[0].Values["count"] != 2 {
-		t.Errorf("count = %v, want 2", rows[0].Values["count"])
-	}
-}
-
-func TestColumnsEmptyTypeWorks(t *testing.T) {
-	s := openTestStore(t)
-	ctx := context.Background()
-	tc := sleepConfig()
-	if len(tc.Columns) != 0 {
-		t.Fatalf("sleepConfig should have empty Columns, got %v", tc.Columns)
-	}
-	cfg := &config.Config{Types: map[string]config.TypeConfig{"sleep": tc}}
-	if err := s.Migrate(ctx, cfg); err != nil {
-		t.Fatalf("Migrate: %v", err)
-	}
-	if err := s.Migrate(ctx, cfg); err != nil {
-		t.Fatalf("Migrate #2: %v", err)
-	}
-
-	start := utcMs(t, "2024-01-01T22:00:00Z")
-	end := utcMs(t, "2024-01-01T23:00:00Z")
-	rec := model.Record{UUID: "u1", StartTime: start, EndTime: end, Values: map[string]float64{}}
-	if n, err := s.ReplaceRecords(ctx, "sleep", tc, []model.Record{rec}); err != nil || n != 1 {
-		t.Fatalf("UpsertRecords: n=%d, err=%v", n, err)
-	}
-
-	recs, err := s.RecordsSince(ctx, "sleep", tc, 0)
-	if err != nil {
-		t.Fatalf("RecordsSince: %v", err)
-	}
-	if len(recs) != 1 || recs[0].UUID != "u1" {
-		t.Fatalf("recs = %v, want [u1]", recs)
+	if len(rows) != 1 || rows[0].Values["v_sum"] != 100 {
+		t.Errorf("集計 = %+v, want v_sum=100", rows)
 	}
 }
 
 func TestGetSetState(t *testing.T) {
-	s := openTestStore(t)
 	ctx := context.Background()
-	cfg := &config.Config{Types: map[string]config.TypeConfig{"weight": weightConfig()}}
-	if err := s.Migrate(ctx, cfg); err != nil {
+	st := newStore(t)
+	if err := st.Migrate(ctx, nil); err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
 
-	v, err := s.GetState(ctx, "missing_key")
-	if err != nil || v != "" {
-		t.Fatalf("GetState(missing) = %q, %v; want \"\", nil", v, err)
+	got, err := st.GetState(ctx, "missing")
+	if err != nil || got != "" {
+		t.Errorf("未設定のキー = %q, %v, want 空", got, err)
 	}
 
-	if err := s.SetState(ctx, "k1", "v1"); err != nil {
+	if err := st.SetState(ctx, "k", "v1"); err != nil {
 		t.Fatalf("SetState: %v", err)
 	}
-	v, err = s.GetState(ctx, "k1")
-	if err != nil || v != "v1" {
-		t.Fatalf("GetState(k1) = %q, %v; want v1, nil", v, err)
+	if err := st.SetState(ctx, "k", "v2"); err != nil {
+		t.Fatalf("SetState（上書き）: %v", err)
 	}
-
-	if err := s.SetState(ctx, "k1", "v2"); err != nil {
-		t.Fatalf("SetState overwrite: %v", err)
-	}
-	v, err = s.GetState(ctx, "k1")
-	if err != nil || v != "v2" {
-		t.Fatalf("GetState(k1) after overwrite = %q, %v; want v2, nil", v, err)
-	}
-}
-
-func TestTypeStatsEmptyAndPopulated(t *testing.T) {
-	s := openTestStore(t)
-	ctx := context.Background()
-	tc := weightConfig()
-	cfg := &config.Config{Types: map[string]config.TypeConfig{"weight": tc}}
-	if err := s.Migrate(ctx, cfg); err != nil {
-		t.Fatalf("Migrate: %v", err)
-	}
-
-	stats, err := s.TypeStats(ctx, "weight")
-	if err != nil {
-		t.Fatalf("TypeStats(empty): %v", err)
-	}
-	if stats != (model.TypeStats{Count: 0, LatestStartTime: 0}) {
-		t.Fatalf("TypeStats(empty) = %+v, want {0 0}", stats)
-	}
-
-	t1 := utcMs(t, "2024-01-01T00:00:00Z")
-	t2 := utcMs(t, "2024-01-02T00:00:00Z")
-	recs := []model.Record{
-		{UUID: "a", StartTime: t1, EndTime: t1, Values: map[string]float64{"weight_kg": 1}},
-		{UUID: "b", StartTime: t2, EndTime: t2, Values: map[string]float64{"weight_kg": 2}},
-	}
-	if _, err := s.ReplaceRecords(ctx, "weight", tc, recs); err != nil {
-		t.Fatalf("UpsertRecords: %v", err)
-	}
-
-	stats, err = s.TypeStats(ctx, "weight")
-	if err != nil {
-		t.Fatalf("TypeStats(populated): %v", err)
-	}
-	if stats.Count != 2 || stats.LatestStartTime != t2 {
-		t.Fatalf("TypeStats(populated) = %+v, want {2 %d}", stats, t2)
-	}
-}
-
-func activityConfig() config.TypeConfig {
-	return config.TypeConfig{
-		SourceTable: "steps_record",
-		TimeLayout:  config.LayoutInterval,
-		Columns:     map[string]config.ColumnConfig{"count": {Column: "count", Scale: 1}},
-		Window:      "all",
-		Daily:       []string{"sum", "count"},
-		Category:    "activity",
-		Dedupe:      true,
-		DateBasis:   config.DateBasisStart,
-	}
-}
-
-func intervalRecord(t *testing.T, uuid, appID, start, end string, count float64) model.Record {
-	t.Helper()
-	return model.Record{
-		UUID:       uuid,
-		StartTime:  utcMs(t, start),
-		EndTime:    utcMs(t, end),
-		ZoneOffset: 0,
-		AppID:      appID,
-		Values:     map[string]float64{"count": count},
-	}
-}
-
-// 端末側で作り直されたレコードが残ると合計が膨らむため、取り込み期間ぶんは
-// 置き換わることを確かめる。
-func TestReplaceRecordsDropsStaleRecordsInRange(t *testing.T) {
-	s := openTestStore(t)
-	ctx := context.Background()
-	tc := weightConfig()
-	cfg := &config.Config{Types: map[string]config.TypeConfig{"weight": tc}}
-	if err := s.Migrate(ctx, cfg); err != nil {
-		t.Fatalf("Migrate: %v", err)
-	}
-
-	old := []model.Record{
-		{UUID: "outside", StartTime: utcMs(t, "2024-01-01T00:00:00Z"), EndTime: utcMs(t, "2024-01-01T00:00:00Z"), AppID: "app1", Values: map[string]float64{"weight_kg": 50}},
-		{UUID: "stale", StartTime: utcMs(t, "2024-02-01T12:00:00Z"), EndTime: utcMs(t, "2024-02-01T12:00:00Z"), AppID: "app1", Values: map[string]float64{"weight_kg": 60}},
-	}
-	if _, err := s.ReplaceRecords(ctx, "weight", tc, old); err != nil {
-		t.Fatalf("ReplaceRecords #1: %v", err)
-	}
-
-	// 2024-02-01 を含む期間を取り込み直す。stale は端末側に無いので消えるべき。
-	fresh := []model.Record{
-		{UUID: "fresh", StartTime: utcMs(t, "2024-02-01T09:00:00Z"), EndTime: utcMs(t, "2024-02-01T09:00:00Z"), AppID: "app1", Values: map[string]float64{"weight_kg": 61}},
-	}
-	if _, err := s.ReplaceRecords(ctx, "weight", tc, fresh); err != nil {
-		t.Fatalf("ReplaceRecords #2: %v", err)
-	}
-
-	got, err := s.RecordsSince(ctx, "weight", tc, 0)
-	if err != nil {
-		t.Fatalf("RecordsSince: %v", err)
-	}
-	var uuids []string
-	for _, r := range got {
-		uuids = append(uuids, r.UUID)
-	}
-	// 取り込み期間より前の outside は端末から消えていても残す。
-	want := []string{"outside", "fresh"}
-	if len(uuids) != len(want) || uuids[0] != want[0] || uuids[1] != want[1] {
-		t.Fatalf("uuids = %v, want %v", uuids, want)
+	if got, err := st.GetState(ctx, "k"); err != nil || got != "v2" {
+		t.Errorf("GetState = %q, %v, want v2", got, err)
 	}
 }
 
 func TestAppPrioritiesRoundTrip(t *testing.T) {
-	s := openTestStore(t)
 	ctx := context.Background()
-	cfg := &config.Config{Types: map[string]config.TypeConfig{"steps": activityConfig()}}
-	if err := s.Migrate(ctx, cfg); err != nil {
+	st := newStore(t)
+	if err := st.Migrate(ctx, nil); err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
 
-	want := model.AppPriorities{1: {"app.high", "app.low"}}
-	if err := s.SetAppPriorities(ctx, want); err != nil {
-		t.Fatalf("SetAppPriorities: %v", err)
-	}
-	// 空の保存で既存を消さない。
-	if err := s.SetAppPriorities(ctx, model.AppPriorities{}); err != nil {
-		t.Fatalf("SetAppPriorities(empty): %v", err)
+	if got, err := st.AppPriorities(ctx); err != nil || len(got) != 0 {
+		t.Errorf("未保存のとき = %v, %v, want 空", got, err)
 	}
 
-	got, err := s.AppPriorities(ctx)
+	want := model.AppPriorities{
+		kind.CategoryActivity: {"a", "b"},
+		kind.CategorySleep:    {"c"},
+	}
+	if err := st.SetAppPriorities(ctx, want); err != nil {
+		t.Fatalf("SetAppPriorities: %v", err)
+	}
+	got, err := st.AppPriorities(ctx)
 	if err != nil {
 		t.Fatalf("AppPriorities: %v", err)
 	}
-	if len(got[1]) != 2 || got[1][0] != "app.high" || got[1][1] != "app.low" {
-		t.Fatalf("AppPriorities = %v, want %v", got, want)
-	}
-}
-
-func TestDailyAggregatesDedupesByAppPriority(t *testing.T) {
-	s := openTestStore(t)
-	ctx := context.Background()
-	tc := activityConfig()
-	cfg := &config.Config{Types: map[string]config.TypeConfig{"steps": tc}}
-	if err := s.Migrate(ctx, cfg); err != nil {
-		t.Fatalf("Migrate: %v", err)
-	}
-	if err := s.SetAppPriorities(ctx, model.AppPriorities{1: {"app.high", "app.low"}}); err != nil {
-		t.Fatalf("SetAppPriorities: %v", err)
+	if len(got) != 2 || got[kind.CategoryActivity][1] != "b" || got[kind.CategorySleep][0] != "c" {
+		t.Errorf("priorities = %+v, want %+v", got, want)
 	}
 
-	recs := []model.Record{
-		// 同じ時間帯を2アプリが書いている。優先度の高い方だけを採る。
-		intervalRecord(t, "h1", "app.high", "2024-03-01T00:00:00Z", "2024-03-01T01:00:00Z", 100),
-		intervalRecord(t, "l1", "app.low", "2024-03-01T00:00:00Z", "2024-03-01T01:00:00Z", 90),
-		// 優先度の高い方が書いていない時間帯は、低い方を採る。
-		intervalRecord(t, "l2", "app.low", "2024-03-01T02:00:00Z", "2024-03-01T03:00:00Z", 50),
+	// 空を渡しても既存を消さない（優先度を持たないエクスポートで重複排除が
+	// 効かなくなるのを防ぐ）。
+	if err := st.SetAppPriorities(ctx, model.AppPriorities{}); err != nil {
+		t.Fatalf("SetAppPriorities（空）: %v", err)
 	}
-	if _, err := s.ReplaceRecords(ctx, "steps", tc, recs); err != nil {
-		t.Fatalf("ReplaceRecords: %v", err)
-	}
-
-	rows, err := s.DailyAggregates(ctx, "steps", tc)
-	if err != nil {
-		t.Fatalf("DailyAggregates: %v", err)
-	}
-	if len(rows) != 1 {
-		t.Fatalf("rows = %d, want 1", len(rows))
-	}
-	if got := rows[0].Values["count_sum"]; got != 150 {
-		t.Errorf("count_sum = %v, want 150", got)
-	}
-	if got := rows[0].Values["count"]; got != 2 {
-		t.Errorf("count = %v, want 2", got)
-	}
-}
-
-// 優先度が未取得のときに落として無くしてしまわないことを確かめる。
-func TestDailyAggregatesKeepsAllWhenNoPriorities(t *testing.T) {
-	s := openTestStore(t)
-	ctx := context.Background()
-	tc := activityConfig()
-	cfg := &config.Config{Types: map[string]config.TypeConfig{"steps": tc}}
-	if err := s.Migrate(ctx, cfg); err != nil {
-		t.Fatalf("Migrate: %v", err)
-	}
-
-	recs := []model.Record{
-		intervalRecord(t, "a1", "app.a", "2024-03-01T00:00:00Z", "2024-03-01T01:00:00Z", 100),
-		intervalRecord(t, "b1", "app.b", "2024-03-01T00:00:00Z", "2024-03-01T01:00:00Z", 90),
-	}
-	if _, err := s.ReplaceRecords(ctx, "steps", tc, recs); err != nil {
-		t.Fatalf("ReplaceRecords: %v", err)
-	}
-
-	rows, err := s.DailyAggregates(ctx, "steps", tc)
-	if err != nil {
-		t.Fatalf("DailyAggregates: %v", err)
-	}
-	if got := rows[0].Values["count_sum"]; got != 190 {
-		t.Errorf("count_sum = %v, want 190", got)
-	}
-}
-
-// 日をまたぐ睡眠が「寝始めた日」に付くと、深夜に寝た日へ2泊ぶんが乗る。
-func TestDailyAggregatesDateBasisEnd(t *testing.T) {
-	s := openTestStore(t)
-	ctx := context.Background()
-	tc := sleepConfig()
-	tc.DateBasis = config.DateBasisEnd
-	cfg := &config.Config{Types: map[string]config.TypeConfig{"sleep": tc}}
-	if err := s.Migrate(ctx, cfg); err != nil {
-		t.Fatalf("Migrate: %v", err)
-	}
-
-	recs := []model.Record{
-		// 3/1 の深夜に寝て 3/1 の朝に起きた（3/1 に帰属）。
-		{UUID: "s1", StartTime: utcMs(t, "2024-03-01T01:00:00Z"), EndTime: utcMs(t, "2024-03-01T07:00:00Z"), AppID: "app1"},
-		// 3/1 の夜に寝て 3/2 の朝に起きた（3/2 に帰属）。
-		{UUID: "s2", StartTime: utcMs(t, "2024-03-01T23:00:00Z"), EndTime: utcMs(t, "2024-03-02T07:00:00Z"), AppID: "app1"},
-	}
-	if _, err := s.ReplaceRecords(ctx, "sleep", tc, recs); err != nil {
-		t.Fatalf("ReplaceRecords: %v", err)
-	}
-
-	rows, err := s.DailyAggregates(ctx, "sleep", tc)
-	if err != nil {
-		t.Fatalf("DailyAggregates: %v", err)
-	}
-	if len(rows) != 2 {
-		t.Fatalf("rows = %d, want 2 (%+v)", len(rows), rows)
-	}
-	if rows[0].Date != "2024-03-01" || rows[0].Values["duration_min_sum"] != 360 {
-		t.Errorf("row[0] = %+v, want 2024-03-01 with 360", rows[0])
-	}
-	if rows[1].Date != "2024-03-02" || rows[1].Values["duration_min_sum"] != 480 {
-		t.Errorf("row[1] = %+v, want 2024-03-02 with 480", rows[1])
+	if got, err := st.AppPriorities(ctx); err != nil || len(got) != 2 {
+		t.Errorf("空を渡した後 = %+v, %v, want 2件のまま", got, err)
 	}
 }

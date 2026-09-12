@@ -1,0 +1,16 @@
+[
+ [
+  "local_date",
+  "local_start",
+  "local_end",
+  "app_id",
+  "duration_min"
+ ],
+ [
+  "2026-09-10",
+  "2026-09-10 23:00:00",
+  "2026-09-11 06:30:00",
+  "com.fitbit.FitbitMobile",
+  450
+ ]
+]
