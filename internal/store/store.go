@@ -6,7 +6,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -16,6 +15,7 @@ import (
 
 	_ "modernc.org/sqlite"
 
+	"health-connect-converter/internal/agg"
 	"health-connect-converter/internal/config"
 	"health-connect-converter/internal/model"
 )
@@ -315,14 +315,15 @@ func (s *Store) RecordsSince(ctx context.Context, typeKey string, tc config.Type
 	return recs, nil
 }
 
-// DailyAggregates は tc.Daily に従って種別 typeKey のレコードを現地日ごとに集約する。
-// tc.Dedupe が真なら、集約の前にアプリ優先度による重複排除を行う。
+// DailyAggregates は種別 typeKey のレコードを集計用モデルへ直し、agg に日次集計を
+// させる。tc.Dedupe が真なら、集約の前にアプリ優先度による重複排除を行う。
 func (s *Store) DailyAggregates(ctx context.Context, typeKey string, tc config.TypeConfig) ([]model.DailyRow, error) {
 	recs, err := s.RecordsSince(ctx, typeKey, tc, 0)
 	if err != nil {
 		return nil, err
 	}
 
+	var order []string
 	if tc.Dedupe {
 		categoryID, ok := tc.CategoryID()
 		if !ok {
@@ -332,10 +333,34 @@ func (s *Store) DailyAggregates(ctx context.Context, typeKey string, tc config.T
 		if err != nil {
 			return nil, err
 		}
-		return aggregateDaily(dedupeByPriority(recs, prios[categoryID]), tc), nil
+		order = prios[categoryID]
 	}
 
-	return aggregateDaily(unweighted(recs), tc), nil
+	return agg.Daily(toAggRecords(recs, tc), agg.Options{Daily: tc.Daily, Dedupe: tc.Dedupe}, order), nil
+}
+
+// toAggRecords は保存用のレコードを集計用モデルへ直す。どの日に数えるかの判断
+// （date_basis）と、期間から求める値（duration_min）はここで済ませる。
+func toAggRecords(recs []model.Record, tc config.TypeConfig) []model.AggRecord {
+	out := make([]model.AggRecord, 0, len(recs))
+	for _, rec := range recs {
+		values := make(map[string]float64, len(rec.Values)+1)
+		for name, v := range rec.Values {
+			values[name] = v
+		}
+		if tc.IncludeDuration {
+			values[durationValueName] = float64(rec.EndTime-rec.StartTime) / 60000.0
+		}
+		out = append(out, model.AggRecord{
+			LocalDate:  localDate(rec, tc.DateBasis),
+			StartTime:  rec.StartTime,
+			EndTime:    rec.EndTime,
+			ZoneOffset: rec.ZoneOffset,
+			AppID:      rec.AppID,
+			Values:     values,
+		})
+	}
+	return out
 }
 
 // localDate はレコードを数える現地日を返す。
@@ -345,248 +370,6 @@ func localDate(rec model.Record, basis string) string {
 		t = rec.EndTime
 	}
 	return time.Unix(t/1000+int64(rec.ZoneOffset), 0).UTC().Format("2006-01-02")
-}
-
-// weighted は重複排除の結果、レコードのうち採用する割合を持つ。時間帯の一部だけが
-// 優先度の高いアプリと重なるとき、重なっていない割合ぶんだけを数える。
-type weighted struct {
-	rec   model.Record
-	ratio float64
-}
-
-func unweighted(recs []model.Record) []weighted {
-	out := make([]weighted, len(recs))
-	for i, rec := range recs {
-		out[i] = weighted{rec: rec, ratio: 1}
-	}
-	return out
-}
-
-func recordValue(rec model.Record, name string) (float64, bool) {
-	if name == durationValueName {
-		return float64(rec.EndTime-rec.StartTime) / 60000.0, true
-	}
-	v, ok := rec.Values[name]
-	return v, ok
-}
-
-type dailyAccum struct {
-	// sum は重複を除いた割合ぶんの合計、rawSum は割合を掛けない合計（平均に使う）。
-	sum    float64
-	rawSum float64
-	min    float64
-	max    float64
-	count  int
-}
-
-func aggregateDaily(recs []weighted, tc config.TypeConfig) []model.DailyRow {
-	valueNames := tc.ValueNames()
-	funcs := make(map[string]bool, len(tc.Daily))
-	for _, fn := range tc.Daily {
-		funcs[fn] = true
-	}
-
-	// 日 -> 値名 -> 集計中の値
-	byDate := make(map[string]map[string]*dailyAccum)
-	recordCount := make(map[string]int)
-
-	for _, w := range recs {
-		date := localDate(w.rec, tc.DateBasis)
-		recordCount[date]++
-
-		accs, ok := byDate[date]
-		if !ok {
-			accs = make(map[string]*dailyAccum, len(valueNames))
-			byDate[date] = accs
-		}
-		for _, name := range valueNames {
-			v, ok := recordValue(w.rec, name)
-			if !ok {
-				continue
-			}
-			acc, ok := accs[name]
-			if !ok {
-				acc = &dailyAccum{min: math.Inf(1), max: math.Inf(-1)}
-				accs[name] = acc
-			}
-			// 合計だけは重複を除いた割合ぶんにする。平均・最小・最大は
-			// 1レコードの測定値そのものを見るものなので割合を掛けない。
-			acc.sum += v * w.ratio
-			acc.rawSum += v
-			acc.count++
-			acc.min = math.Min(acc.min, v)
-			acc.max = math.Max(acc.max, v)
-		}
-	}
-
-	dates := make([]string, 0, len(byDate))
-	for date := range recordCount {
-		dates = append(dates, date)
-	}
-	sort.Strings(dates)
-
-	rows := make([]model.DailyRow, 0, len(dates))
-	for _, date := range dates {
-		row := model.DailyRow{Date: date, Values: make(map[string]float64)}
-		for name, acc := range byDate[date] {
-			if acc.count == 0 {
-				continue
-			}
-			if funcs["sum"] {
-				row.Values[name+"_sum"] = acc.sum
-			}
-			if funcs["mean"] {
-				row.Values[name+"_mean"] = acc.rawSum / float64(acc.count)
-			}
-			if funcs["min"] {
-				row.Values[name+"_min"] = acc.min
-			}
-			if funcs["max"] {
-				row.Values[name+"_max"] = acc.max
-			}
-		}
-		if funcs["count"] {
-			row.Values["count"] = float64(recordCount[date])
-		}
-		rows = append(rows, row)
-	}
-	return rows
-}
-
-type interval struct {
-	start int64
-	end   int64
-}
-
-// dedupeByPriority は、優先度の高いアプリが既に覆っている時間帯のレコードを落とす。
-// 複数のアプリが同じ実測（歩数・消費カロリーなど）を書いていると単純な合計が
-// 多重計上になるため、Health Connect 自身の集計と同じく優先度で1つに絞る。
-// order が空（優先度が読めていない）なら何もしない。
-func dedupeByPriority(recs []model.Record, order []string) []weighted {
-	if len(order) == 0 || len(recs) == 0 {
-		return unweighted(recs)
-	}
-
-	rank := make(map[string]int, len(order))
-	for i, app := range order {
-		rank[app] = i
-	}
-	rankOf := func(appID string) int {
-		if r, ok := rank[appID]; ok {
-			return r
-		}
-		// 優先度に載っていないアプリは最下位。順序を決めきれないと結果が
-		// 実行ごとに変わるため、アプリIDで安定させる。
-		return len(order)
-	}
-
-	byApp := make(map[string][]model.Record)
-	for _, rec := range recs {
-		byApp[rec.AppID] = append(byApp[rec.AppID], rec)
-	}
-	apps := make([]string, 0, len(byApp))
-	for app := range byApp {
-		apps = append(apps, app)
-	}
-	sort.Slice(apps, func(i, j int) bool {
-		if ri, rj := rankOf(apps[i]), rankOf(apps[j]); ri != rj {
-			return ri < rj
-		}
-		return apps[i] < apps[j]
-	})
-
-	var covered []interval
-	var kept []weighted
-	for _, app := range apps {
-		for _, rec := range byApp[app] {
-			ratio := uncoveredRatio(covered, rec.StartTime, rec.EndTime)
-			if ratio == 0 {
-				continue
-			}
-			kept = append(kept, weighted{rec: rec, ratio: ratio})
-		}
-		// このアプリが「その日に記録していた範囲」を覆ったものとして扱う。
-		// 歩数のように歩いた区間しかレコードが無い種別では、レコード単位で
-		// 覆うと隙間が空き、そこへ下位アプリの同じ実測が入り込んで多重計上が残る。
-		covered = mergeIntervals(append(covered, dailySpans(byApp[app])...))
-	}
-
-	sort.SliceStable(kept, func(i, j int) bool { return kept[i].rec.StartTime < kept[j].rec.StartTime })
-	return kept
-}
-
-// dailySpans はアプリのレコードを現地日ごとにまとめ、その日の最初から最後までを
-// 1つの区間として返す。
-func dailySpans(recs []model.Record) []interval {
-	spans := make(map[string]interval, len(recs))
-	for _, rec := range recs {
-		date := localDate(rec, config.DateBasisStart)
-		span, ok := spans[date]
-		if !ok {
-			spans[date] = interval{start: rec.StartTime, end: rec.EndTime}
-			continue
-		}
-		span.start = min(span.start, rec.StartTime)
-		span.end = max(span.end, rec.EndTime)
-		spans[date] = span
-	}
-
-	out := make([]interval, 0, len(spans))
-	for _, span := range spans {
-		out = append(out, span)
-	}
-	return out
-}
-
-func mergeIntervals(ivs []interval) []interval {
-	if len(ivs) <= 1 {
-		return ivs
-	}
-	sort.Slice(ivs, func(i, j int) bool { return ivs[i].start < ivs[j].start })
-	merged := ivs[:1]
-	for _, iv := range ivs[1:] {
-		last := &merged[len(merged)-1]
-		if iv.start <= last.end {
-			if iv.end > last.end {
-				last.end = iv.end
-			}
-			continue
-		}
-		merged = append(merged, iv)
-	}
-	return merged
-}
-
-// uncoveredRatio は [start, end) のうち covered に含まれない割合を返す。
-// covered はマージ済みで start 昇順であること。瞬時値（start == end）は
-// その時刻を含む区間があれば 0、無ければ 1 を返す。
-func uncoveredRatio(covered []interval, start, end int64) float64 {
-	if start > end {
-		start, end = end, start
-	}
-	if start == end {
-		if pointCovered(covered, start) {
-			return 0
-		}
-		return 1
-	}
-
-	var overlap int64
-	i := sort.Search(len(covered), func(i int) bool { return covered[i].end > start })
-	for ; i < len(covered) && covered[i].start < end; i++ {
-		overlap += min(covered[i].end, end) - max(covered[i].start, start)
-	}
-
-	total := end - start
-	if overlap >= total {
-		return 0
-	}
-	return float64(total-overlap) / float64(total)
-}
-
-func pointCovered(covered []interval, t int64) bool {
-	i := sort.Search(len(covered), func(i int) bool { return covered[i].end > t })
-	return i < len(covered) && covered[i].start <= t
 }
 
 // SetAppPriorities は Health Connect のアプリ優先度を state へ保存する。
