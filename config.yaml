@@ -19,7 +19,10 @@ types:
       bpm:
         column: beats_per_minute
     category: vitals
-    window: all
+    # 常時計測のウェアラブルが入ると1日約36,000件になり、生データタブが
+    # 数十日でシートの上限（1,000万セル）に達する。日次集計は window に
+    # 関わらず全期間残るため、生データは直近1日だけ持つ。
+    window: 1d
     daily: [mean, min, max, count]
 
   sleep:
